@@ -728,7 +728,7 @@ class MirrorLM(nn.Module):
         fw_scale = torch.sigmoid(self.meta_out_fw(self.meta_state)).item() * 0.1
 
         return lr, fw_scale
-def train_epoch(real_model, tok, corpus, device, window=16, opt=None):
+def train_epoch(real_model, tok, corpus, device, window=16, opt=None,lr=1e-4):
     real_model.train()
     X, Y = build_sequences_sp(corpus, tok, window=window)
     if X.numel() == 0:
@@ -738,7 +738,7 @@ def train_epoch(real_model, tok, corpus, device, window=16, opt=None):
     Y = Y.to(device)
 
     if opt is None:
-        opt = optim.Adam(real_model.parameters(), lr=1e-3)
+        opt = optim.Adam(real_model.parameters(), lr=lr)
 
     batch_size = 1024
     total_loss = 0.0
@@ -948,7 +948,7 @@ def main():
     mirror_model = MirrorLM(vocab_size, size, size, context).to(device_mirror)
     hippocampus = Hippocampus(max_episodes=size).to(device_real)
     max_epochs = 40
-    window=64
+    window = 16
 
     def test_generation(model, tok, prompt, device):
         ids = tok.encode(prompt)
@@ -973,7 +973,7 @@ def main():
 
     for phase_name, phase_data, phase_ppl in phases:
         print(f"\n=== Training {phase_name} ===")
-
+        phase_data = random.shuffle(phase_data)
         new_tokens = tok.observe_sentence(" ".join(phase_data))
         if new_tokens:
             new_vocab_size = tok.vocab_size_actual
