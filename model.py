@@ -752,6 +752,8 @@ def train_epoch(real_model, tok, corpus, device, window=16, opt=None,lr=1e-4):
         logits, _, _ = real_model(xb)
         loss = F.cross_entropy(logits, yb)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0)
+
         opt.step()
 
         total_loss += loss.item()
@@ -973,7 +975,6 @@ def main():
 
     for phase_name, phase_data, phase_ppl in phases:
         print(f"\n=== Training {phase_name} ===")
-        phase_data = random.shuffle(phase_data)
         new_tokens = tok.observe_sentence(" ".join(phase_data))
         if new_tokens:
             new_vocab_size = tok.vocab_size_actual
