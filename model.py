@@ -738,7 +738,7 @@ def train_epoch(real_model, tok, corpus, device, window=16, scheduler=None, opt=
     Y = Y.to(device)
 
     if opt is None:
-        opt = optim.Adam(real_model.parameters(), lr=lr)
+        opt = optim.AdamW(real_model.parameters(), lr=lr)
 
     batch_size = 1024
     total_loss = 0.0
@@ -801,7 +801,7 @@ def consolidate_memory(real_model, mirror_model, hippocampus, tok,
                        base_corpus=None):
 
     real_model.train()
-    opt = torch.optim.Adam(real_model.parameters(), lr=1e-5)
+    opt = torch.optim.AdamW(real_model.parameters(), lr=1e-5)
 
     for _ in range(rounds):
         batch = hippocampus.sample_batch(batch_size=4)
@@ -873,7 +873,7 @@ def learn_new_sentence(real_model, mirror_model, hippocampus,
 
     real_model.train()
     adapter_params = [p for n, p in real_model.named_parameters() if "adapter" in n]
-    opt = torch.optim.Adam(adapter_params, lr=1e-3)
+    opt = torch.optim.AdamW(adapter_params, lr=1e-3)
 
     for _ in range(adapter_steps):
         opt.zero_grad()
@@ -949,11 +949,11 @@ def main():
     vocab_size = 120
     size = 512
     context = 128
-    lr = 1e-4
+    lr = 3e-4
     real_model = LiquidLM(vocab_size, size, size, context).to(device_real)
     mirror_model = MirrorLM(vocab_size, size, size, context).to(device_mirror)
     hippocampus = Hippocampus(max_episodes=size).to(device_real)
-    opt = optim.Adam(real_model.parameters(), lr=lr)
+    opt = optim.AdamW(real_model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=2000)
 
     max_epochs = 40
