@@ -6,6 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import json
+import multiprocessing as mp
+from collections import Counter
 
 def export_model_state(tok, real_model, hippocampus, filename="model_export.json"):
     export_data = {}
@@ -33,14 +35,11 @@ class DynamicTokenizer:
         self.special_tokens = ["<pad>", "<unk>"]
         self.token2id = {t: i for i, t in enumerate(self.special_tokens)}
         self.id2token = {i: t for t, i in self.token2id.items()}
-
-        self.char2id = {}   
-        self.subword2id = {} 
-        self.word2id = {} 
-
+        self.char2id = {}
+        self.subword2id = {}
+        self.word2id = {}
         self.word_freq = {}
         self.subword_freq = {}
-
         self.min_subword_freq = min_subword_freq
         self.min_word_freq = min_word_freq
 
@@ -58,22 +57,25 @@ class DynamicTokenizer:
     def vocab_size_actual(self):
         return len(self.token2id)
 
-
     def build_char_vocab(self, corpus):
         chars = set()
         for line in corpus:
             for ch in line:
                 if not ch.isspace():
                     chars.add(ch)
-
         for ch in sorted(chars):
             tok = f"<ch:{ch}>"
             self._add_token(tok)
             self.char2id[ch] = self.token2id[tok]
 
-    def train_subwords(self, corpus, max_merges=5000):
-        from collections import Counter
+    def _count_pairs_chunk(self, chunk):
+        c = Counter()
+        for w in chunk:
+            for i in range(len(w) - 1):
+                c[(w[i], w[i+1])] += 1
+        return c
 
+    def train_subwords(self, corpus, max_merges=5000, n_workers=4):
         for ch in self.char2id:
             self.subword2id[ch] = self.char2id[ch]
 
@@ -84,12 +86,23 @@ class DynamicTokenizer:
         for line in corpus:
             for w in line.strip().split():
                 vocab.append(split_word(w))
+
+        if not vocab:
+            return
+
         for _ in range(max_merges):
+            if len(vocab) < n_workers:
+                chunks = [vocab]
+            else:
+                chunk_size = max(1, len(vocab) // n_workers)
+                chunks = [vocab[i:i+chunk_size] for i in range(0, len(vocab), chunk_size)]
+
+            with mp.Pool(n_workers) as pool:
+                counters = pool.map(self._count_pairs_chunk, chunks)
+
             pair_counts = Counter()
-            for w in vocab:
-                for i in range(len(w) - 1):
-                    pair = (w[i], w[i+1])
-                    pair_counts[pair] += 1
+            for c in counters:
+                pair_counts.update(c)
 
             if not pair_counts:
                 break
@@ -106,7 +119,6 @@ class DynamicTokenizer:
             self._add_token(tok)
             self.subword2id[new_sw] = self.token2id[tok]
 
-            # merge in vocab
             new_vocab = []
             for w in vocab:
                 i = 0
@@ -124,36 +136,29 @@ class DynamicTokenizer:
     def observe_sentence(self, sentence):
         words = sentence.strip().split()
         new_tokens = []
-
         for w in words:
             self.word_freq[w] = self.word_freq.get(w, 0) + 1
-
             if self.word_freq[w] >= self.min_word_freq and w not in self.word2id:
                 tok = f"<w:{w}>"
                 self._add_token(tok)
                 self.word2id[w] = self.token2id[tok]
                 new_tokens.append(tok)
-
         return new_tokens
 
     def _encode_word(self, w):
         if w in self.word2id:
             return [self.word2id[w]]
-
         ids = []
         i = 0
         L = len(w)
-
         while i < L:
             best = None
             best_len = 0
-
             for l in range(1, L - i + 1):
                 sw = w[i:i+l]
                 if sw in self.subword2id:
                     best = self.subword2id[sw]
                     best_len = l
-
             if best is not None:
                 ids.append(best)
                 i += best_len
@@ -164,7 +169,6 @@ class DynamicTokenizer:
                 else:
                     ids.append(self.token2id["<unk>"])
                 i += 1
-
         return ids
 
     def encode(self, text):
@@ -173,26 +177,20 @@ class DynamicTokenizer:
             ids.extend(self._encode_word(w))
         return ids
 
-
     def decode(self, ids):
         pieces = []
-
         for i in ids:
             if i not in self.id2token:
                 continue
-
             tok = self.id2token[i]
-
             if tok in self.special_tokens:
                 continue
-
             if tok.startswith("<w:"):
                 pieces.append(tok[3:-1])
             elif tok.startswith("<sw:"):
                 pieces.append(tok[4:-1])
             elif tok.startswith("<ch:"):
                 pieces.append(tok[4:-1])
-
         return "".join(pieces)
 
 def build_sequences_sp(corpus, tok, window=16):

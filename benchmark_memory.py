@@ -84,29 +84,18 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
 
-    # tokenizer
     tok = v53.DynamicTokenizer()
     tok.build_char_vocab(["A", "B"])
 
-    # model
     vocab_size = tok.vocab_size_actual
     model = v53.LiquidLM(vocab_size=vocab_size, d_model=64, hidden_size=64)
     model.to(device)
 
-    # 1) train op 2 bits
     micro_train_two_bits(model, tok, steps=800, seq_len=64, device=device)
 
-    # 2) test 2-bit context window
     test_two_bit_context_window(model, tok, device=device)
 
 
 if __name__ == "__main__":
     main()
 
-'''
-FAIL: forgets at distance 33728
-pred_first=2, first=2, pred_last=2, last=3
-
-=== RESULT ===
-2-bit effective context window: 33664
-'''
