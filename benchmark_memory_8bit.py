@@ -1,7 +1,6 @@
-#!/usr/bin/env python3
 import torch
 import random
-import v53
+import model
 import torch.nn.functional as F
 
 

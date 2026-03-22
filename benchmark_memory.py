@@ -1,6 +1,6 @@
 import torch
 import random
-import v53
+import model
 import torch.nn.functional as F
 
 def micro_train_two_bits(model, tok, steps=800, seq_len=64, device="cpu"):
