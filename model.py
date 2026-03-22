@@ -728,7 +728,7 @@ class MirrorLM(nn.Module):
         fw_scale = torch.sigmoid(self.meta_out_fw(self.meta_state)).item() * 0.1
 
         return lr, fw_scale
-def train_epoch(real_model, tok, corpus, device, window=16, opt=None,lr=1e-4):
+def train_epoch(real_model, tok, corpus, device, window=16, scheduler=None, opt=None, lr=1e-4):
     real_model.train()
     X, Y = build_sequences_sp(corpus, tok, window=window)
     if X.numel() == 0:
@@ -752,9 +752,12 @@ def train_epoch(real_model, tok, corpus, device, window=16, opt=None,lr=1e-4):
         logits, _, _ = real_model(xb)
         loss = F.cross_entropy(logits, yb)
         loss.backward()
+
         torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0)
 
-        opt.step()
+        opt.step()        
+        if scheduler is not None:
+            scheduler.step()    
 
         total_loss += loss.item()
         n_batches += 1
@@ -946,9 +949,13 @@ def main():
     vocab_size = 120
     size = 512
     context = 128
+    lr = 1e-4
     real_model = LiquidLM(vocab_size, size, size, context).to(device_real)
     mirror_model = MirrorLM(vocab_size, size, size, context).to(device_mirror)
     hippocampus = Hippocampus(max_episodes=size).to(device_real)
+    opt = optim.Adam(real_model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=2000)
+
     max_epochs = 40
     window = 16
 
@@ -984,7 +991,7 @@ def main():
             mirror_model.to(device_mirror)
 
         for epoch in range(max_epochs):
-            loss = train_epoch(real_model, tok, phase_data, device_real, window=window)
+            loss = train_epoch(real_model, tok, phase_data, device_real, window=window,scheduler=scheduler,lr=lr,opt=opt)
             acc = compute_accuracy(real_model, *build_sequences_sp(phase_data, tok), device_real)
             ppl = test_perplexity(real_model, tok, phase_data, device_real)
             print(f"{phase_name} | epoch {epoch+1}/{max_epochs} | loss={loss[0]:.2f} | acc={acc:.2f}% | ppl={ppl:.2f}")
