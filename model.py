@@ -593,7 +593,7 @@ class LiquidLM(nn.Module):
             nn.Linear(hidden_size // 8, hidden_size)
         )
         self.ssm = S4DSSM(d_state=128, d_model=d_model)
-
+        self.pre_norm = nn.LayerNorm(d_model)
         self.adapter.requires_grad_(False)
 
     def grow_vocab(self, new_vocab_size, tok):
@@ -623,7 +623,7 @@ class LiquidLM(nn.Module):
 
         x = self.embedding(input_ids)
         x = self.attn(x)
-
+        x = self.pre_norm(x)
         x_ssm = self.ssm(x)  
 
         x = x + x_ssm
@@ -939,10 +939,10 @@ def main():
 
     phases = [
         ("phase1_simple_svo", curriculum["phase1_simple_svo"], 16),
-        ("phase2_svo_adv", curriculum["phase2_svo_adv"], 1),
-        ("phase3_svo_prep_loc", curriculum["phase3_svo_prep_loc"], 1),
-        ("phase4_compound", curriculum["phase4_compound"], 2),
-        ("phase5_stories", curriculum["phase5_stories"], 3),
+        ("phase2_svo_adv", curriculum["phase2_svo_adv"], 16),
+        ("phase3_svo_prep_loc", curriculum["phase3_svo_prep_loc"], 16),
+        ("phase4_compound", curriculum["phase4_compound"], 16),
+        ("phase5_stories", curriculum["phase5_stories"], 16),
     ]
 
     tok = DynamicTokenizer()
