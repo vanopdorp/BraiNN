@@ -8,6 +8,8 @@ import torch.optim as optim
 import json
 import multiprocessing as mp
 from collections import Counter
+from torch.amp import autocast, GradScaler
+
 
 def export_model_state(tok, real_model, hippocampus, filename="model_export.json"):
     export_data = {}
@@ -728,6 +730,7 @@ class MirrorLM(nn.Module):
         fw_scale = torch.sigmoid(self.meta_out_fw(self.meta_state)).item() * 0.1
 
         return lr, fw_scale
+
 def train_epoch(real_model, tok, corpus, device, window=16, scheduler=None, opt=None, lr=1e-4):
     real_model.train()
     X, Y = build_sequences_sp(corpus, tok, window=window)
@@ -740,6 +743,8 @@ def train_epoch(real_model, tok, corpus, device, window=16, scheduler=None, opt=
     if opt is None:
         opt = optim.AdamW(real_model.parameters(), lr=lr)
 
+    scaler = GradScaler(device=device)
+
     batch_size = 1024
     total_loss = 0.0
     n_batches = 0
@@ -749,15 +754,22 @@ def train_epoch(real_model, tok, corpus, device, window=16, scheduler=None, opt=
         yb = Y[i:i+batch_size]
 
         opt.zero_grad()
-        logits, _, _ = real_model(xb)
-        loss = F.cross_entropy(logits, yb)
-        loss.backward()
 
+        with autocast("cuda"):
+            logits, _, _ = real_model(xb)
+            loss = F.cross_entropy(logits, yb)
+
+        scaler.scale(loss).backward()
+
+
+        scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0)
 
-        opt.step()        
+        scaler.step(opt)
+        scaler.update()
+
         if scheduler is not None:
-            scheduler.step()    
+            scheduler.step()
 
         total_loss += loss.item()
         n_batches += 1
