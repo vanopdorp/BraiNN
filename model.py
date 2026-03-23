@@ -454,7 +454,6 @@ class WorkingMemory(nn.Module):
         new_wm_state = wm_state + delta
         return read_vec, new_wm_state
 
-
 class LiquidSelfAttention(nn.Module):
     def __init__(self, d_model, num_heads=2, eps=1e-6):
         super().__init__()
@@ -473,34 +472,27 @@ class LiquidSelfAttention(nn.Module):
     def phi(self, x):
         return F.elu(x) + 1.0
 
-    def forward(self, x, **kwargs):
+    def forward(self, x):
         B, T, D = x.shape
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim)
 
-        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self.phi(q)
+        k = self.phi(k)
 
-        q_phi = self.phi(q)
-        k_phi = self.phi(k)
+        k_sum = k.sum(dim=1)
+        kv_sum = torch.einsum("bthd,bthv->bhdv", k, v)
 
-        KV = torch.matmul(k_phi.transpose(-2, -1), v)
-        num = torch.matmul(q_phi, KV)
+        out = torch.einsum("bthd,bhdv->bthv", q, kv_sum)
+        z = torch.einsum("bthd,bhd->bth", q, k_sum)
+        z = (z + self.eps).unsqueeze(-1)
 
-        ones = torch.ones(B, self.num_heads, T, 1, device=x.device, dtype=x.dtype)
-        K1 = torch.matmul(k_phi.transpose(-2, -1), ones)
-        denom = torch.matmul(q_phi, K1).squeeze(-1)
-        denom = denom.unsqueeze(-1) + self.eps
-        attn_out = num / denom
-
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, T, D)
-        attn_out = self.out_proj(attn_out)
+        out = out / z
+        out = out.reshape(B, T, D)
 
         gate = torch.sigmoid(self.gate_proj(x))
-        return gate * attn_out + (1.0 - gate) * x
-
+        return gate * out + (1.0 - gate) * x
 
 class LiquidGRUCell(nn.Module):
     def __init__(self, input_size, hidden_size):
@@ -745,7 +737,7 @@ def train_epoch(real_model, tok, corpus, device, window=16, scheduler=None, opt=
 
     scaler = GradScaler(device=device)
 
-    batch_size = 128
+    batch_size = 256
     total_loss = 0.0
     n_batches = 0
 
@@ -906,6 +898,13 @@ def learn_new_sentence(real_model, mirror_model, hippocampus,
         probs = torch.softmax(logits_new, dim=-1)
         surpr = 1.0 - probs.gather(1, Y_new.unsqueeze(1)).mean().item()
         hippocampus.store(sentence, float(surpr ** 2))
+def reset_rel_world(model):
+    rw = model.rel_world
+    rw.node_reprs = torch.empty(0, model.hidden_size, device=rw.W_msg.weight.device)
+    rw.edge_src  = torch.empty(0, dtype=torch.long, device=rw.W_msg.weight.device)
+    rw.edge_dst  = torch.empty(0, dtype=torch.long, device=rw.W_msg.weight.device)
+    rw.edge_rel  = torch.empty(0, model.hidden_size, device=rw.W_msg.weight.device)
+    rw.edge_conf = torch.empty(0, 1, device=rw.W_msg.weight.device)
 
 def compute_accuracy(model, X, Y, device):
     model.eval()
@@ -919,7 +918,7 @@ def compute_accuracy(model, X, Y, device):
     correct = 0
     total = Y.size(0)
 
-    batch_size = 1024 
+    batch_size = 256
 
     with torch.no_grad():
         for i in range(0, total, batch_size):
@@ -946,14 +945,14 @@ def main():
         device_mirror = torch.device("cpu")
 
     import json
-    with open("curriculum.json", "r", encoding="utf-8") as f:
+    with open("/kaggle/input/datasets/joepvanopdorp/curriculum-english2/curriculum.json", "r", encoding="utf-8") as f:
         curriculum = json.load(f)
 
     phases = [
-        ("phase1_simple_svo", curriculum["phase1_simple_svo"], 16),
-        ("phase2_svo_adv", curriculum["phase2_svo_adv"], 10.5),
-        ("phase3_svo_prep_loc", curriculum["phase3_svo_prep_loc"],9),
-        ("phase4_compound", curriculum["phase4_compound"], 16),
+        ("phase1_simple_svo", curriculum["phase1_simple_svo"], 19),
+        ("phase2_svo_adv", curriculum["phase2_svo_adv"], 13.3),
+        ("phase3_svo_prep_loc", curriculum["phase3_svo_prep_loc"],323),
+        ("phase4_compound", curriculum["phase4_compound"], 13.7),
         ("phase5_stories", curriculum["phase5_stories"], 16),
     ]
 
@@ -961,7 +960,7 @@ def main():
     vocab_size = 120
     size = 512
     context = 128
-    lr = 3e-4
+    lr = 5e-4
     real_model = LiquidLM(vocab_size, size, size, context).to(device_real)
     mirror_model = MirrorLM(vocab_size, size, size, context).to(device_mirror)
     hippocampus = Hippocampus(max_episodes=size).to(device_real)
@@ -969,7 +968,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=2000)
 
     max_epochs = 40
-    window = 16
+    window = 8
 
     def test_generation(model, tok, prompt, device):
         ids = tok.encode(prompt)
@@ -1010,6 +1009,8 @@ def main():
             if ppl < phase_ppl:
                 print(f"{phase_name} mastered")
                 break
+            reset_rel_world(real_model)
+            real_model._wm_state = None
 
         sample_prompt = phase_data[0].split()[0] + " "
         gen = test_generation(real_model, tok, sample_prompt, device_real)

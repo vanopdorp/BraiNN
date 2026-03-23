@@ -10,20 +10,63 @@ SUBJECTS = [
 ]
 
 VERB_OBJECTS = {
-    "runs": ["in the park", "on the street", "in the garden"],
-    "walks": ["in the park", "on the street", "in the house"],
-    "sleeps": ["in the bed", "on the couch", "in the house"],
-    "sits": ["on the chair", "on the couch", "on the bed"],
-    "stands": ["in the garden", "on the street", "by the tree"],
-    "flies": ["in the sky", "over the park"],
-    "swims": ["in the river", "in the lake", "in the water"],
-    "jumps": ["over the fence", "over the log"],
-    "eats": ["the food", "the grass", "the meal"],
-    "drinks": ["the water", "the milk"],
-    "plays": ["with the ball", "in the garden"],
-    "sings": ["a song"],
-    "cries": ["softly"],
-    "laughs": ["loudly"]
+    "runs": ["in the park", "on the street", "in the garden", "towards the house", "around the tree", "through the field"],
+    "walks": ["in the park", "on the street", "in the house", "along the river", "through the forest", "towards the shop"],
+    "jumps": ["over the fence", "over the log", "over the rock", "across the stream", "over the puddle"],
+    "climbs": ["the tree", "the hill", "the ladder", "the stairs", "the rock"],
+    "crawls": ["under the table", "through the grass", "under the bed", "through the tunnel"],
+
+    "sits": ["on the chair", "on the couch", "on the bed", "on the grass", "on the rock"],
+    "stands": ["in the garden", "on the street", "by the tree", "near the river", "in the doorway"],
+    "lies": ["on the bed", "on the floor", "in the grass", "on the couch"],
+
+    "barks": ["loudly", "softly", "at the bird", "at the stranger"],
+    "meows": ["softly", "loudly", "at the window"],
+    "flies": ["in the sky", "over the park", "over the river", "around the tree"],
+    "swims": ["in the river", "in the lake", "in the water", "across the pond"],
+
+    "eats": ["the food", "the grass", "the meal", "the apple", "the bread", "the cookie"],
+    "drinks": ["the water", "the milk", "the juice", "from the bowl"],
+    "chews": ["the toy", "the stick", "the bone", "the leaf"],
+
+    "sings": ["a song", "softly", "happily"],
+    "cries": ["softly", "loudly", "in the room"],
+    "laughs": ["loudly", "happily", "quietly"],
+
+    "plays": ["with the ball", "in the garden", "with the toy", "with the stick", "with the water"],
+    "talks": ["to the girl", "to the boy", "to the woman", "to the man"],
+    "helps": ["the boy", "the girl", "the woman", "the man"],
+    "hugs": ["the dog", "the cat", "the baby", "the friend"],
+    "watches": ["the bird", "the sky", "the river", "the clouds", "the trees"],
+    "follows": ["the dog", "the cat", "the boy", "the girl"],
+
+    "thinks about": ["the game", "the food", "the walk", "the story"],
+    "dreams about": ["the sky", "the adventure", "the forest", "the river"],
+
+    "looks at": ["the tree", "the house", "the garden", "the river", "the sky"],
+    "points at": ["the bird", "the car", "the house", "the flower"],
+
+    "waits": ["in the rain", "under the tree", "in the sunshine", "by the door"],
+    "rests": ["in the shade", "under the tree", "on the grass"],
+
+    "opens": ["the door", "the window", "the box"],
+    "closes": ["the door", "the window", "the book"],
+    "carries": ["the bag", "the box", "the toy", "the basket"],
+    "pushes": ["the cart", "the door", "the box"],
+    "pulls": ["the rope", "the cart", "the toy"],
+
+    "finds": ["a stone", "a leaf", "a stick", "a flower"],
+    "picks up": ["the toy", "the stick", "the ball", "the book"],
+    "drops": ["the toy", "the stick", "the ball", "the book"],
+
+    "feels": ["happy", "sad", "tired", "excited", "calm"],
+    "seems": ["happy", "angry", "calm", "nervous"],
+
+    "waits for": ["the bus", "the friend", "the dog"],
+    "looks for": ["the toy", "the ball", "the cat", "the dog"],
+
+    "remembers": ["the game", "the story", "the walk"],
+    "forgets": ["the toy", "the plan", "the idea"],
 }
 
 ADVERBS = [
@@ -117,8 +160,8 @@ def run_generator(gen_func, n_samples=None):
 def generate_curriculum_json(
     n_phase1=5000,
     n_phase2=5000,
-    n_phase3=10000,
-    n_phase4=10000,
+    n_phase3=5000,
+    n_phase4=5000,
     n_phase5=5000,
     n_workers=5,
     output_file="curriculum.json"
