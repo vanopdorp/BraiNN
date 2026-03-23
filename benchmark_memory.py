@@ -58,10 +58,10 @@ def test_two_bit_context_window(model, tok, device="cpu"):
         x_rev = torch.tensor([list(reversed(seq))], dtype=torch.long, device=device)
 
         with torch.no_grad():
-            logits_last, _ = model(x)
+            logits_last, _, _ = model(x)
             pred_last = logits_last.argmax(dim=-1).item()
 
-            logits_first, _ = model(x_rev)
+            logits_first, _, _ = model(x_rev)
             pred_first = logits_first.argmax(dim=-1).item()
 
         ok_first = (pred_first == first)
