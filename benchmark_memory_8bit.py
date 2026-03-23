@@ -1,6 +1,6 @@
 import torch
 import random
-import model
+import model as Cmodel
 import torch.nn.functional as F
 
 
@@ -24,7 +24,7 @@ def micro_train_eight_bits(model, tok, steps=800, seq_len=256, device="cpu"):
             x = torch.tensor([rotated], dtype=torch.long, device=device)
             target = torch.tensor([bits[j]], dtype=torch.long, device=device)
 
-            logits, _ = model(x)
+            logits, _,_  = model(x)
             loss_j = F.cross_entropy(logits, target)
             losses.append(loss_j)
 
@@ -64,7 +64,7 @@ def test_eight_bit_context_window(model, tok, device="cpu"):
 
             x = torch.tensor([rotated], dtype=torch.long, device=device)
             with torch.no_grad():
-                logits, _ = model(x)
+                logits, _ ,_= model(x)
                 pred = logits.argmax(dim=-1).item()
 
             if pred != bits[j]:
@@ -89,12 +89,12 @@ def main():
     print("Device:", device)
 
 
-    tok = v53.DynamicTokenizer()
+    tok = Cmodel.DynamicTokenizer()
     tok.build_char_vocab(["A", "B"])
 
 
     vocab_size = tok.vocab_size_actual
-    model = v53.LiquidLM(vocab_size=vocab_size, d_model=64, hidden_size=64)
+    model = Cmodel.LiquidLM(vocab_size=vocab_size, d_model=64, hidden_size=64)
     model.to(device)
 
     model.rel_world.store = lambda *args, **kwargs: None

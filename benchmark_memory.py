@@ -1,6 +1,6 @@
 import torch
 import random
-import model
+import model as Cmodel
 import torch.nn.functional as F
 
 def micro_train_two_bits(model, tok, steps=800, seq_len=64, device="cpu"):
@@ -21,10 +21,10 @@ def micro_train_two_bits(model, tok, steps=800, seq_len=64, device="cpu"):
 
         opt.zero_grad()
 
-        logits_last, _ = model(x)
+        logits_last, _, _ = model(x)
         loss_last = F.cross_entropy(logits_last, torch.tensor([last], device=device))
 
-        logits_first, _ = model(x_rev)
+        logits_first, _, _ = model(x_rev)
         loss_first = F.cross_entropy(logits_first, torch.tensor([first], device=device))
 
         loss = loss_first + loss_last
@@ -84,11 +84,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
 
-    tok = v53.DynamicTokenizer()
+    tok = Cmodel.DynamicTokenizer()
     tok.build_char_vocab(["A", "B"])
 
     vocab_size = tok.vocab_size_actual
-    model = v53.LiquidLM(vocab_size=vocab_size, d_model=64, hidden_size=64)
+    model = Cmodel.LiquidLM(vocab_size=vocab_size, d_model=64, hidden_size=64)
     model.to(device)
 
     micro_train_two_bits(model, tok, steps=800, seq_len=64, device=device)

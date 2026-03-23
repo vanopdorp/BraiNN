@@ -193,7 +193,7 @@ class DynamicTokenizer:
                 pieces.append(tok[4:-1])
             elif tok.startswith("<ch:"):
                 pieces.append(tok[4:-1])
-        return "".join(pieces)
+        return " ".join(pieces)
 
 def build_sequences_sp(corpus, tok, window=16):
     X = []
