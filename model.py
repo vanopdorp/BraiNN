@@ -618,16 +618,21 @@ class LiquidLM(nn.Module):
         x = self.embedding(input_ids)
         x = self.attn(x)
         x = self.pre_norm(x)
-        x_ssm = self.ssm(x)  
-
+        x_ssm = self.ssm(x)
         x = x + x_ssm
 
         h0 = torch.zeros(self.num_layers, B, self.hidden_size, device=device)
         gru_out, _ = self.gru(x, h0)
         h_last = gru_out[:, -1, :]
 
-        h_last = h_last + self.adapter(h_last)
+        subj_vec, act_vec, obj_vec = self.concepts(gru_out)
+        rel_ctx = self.rel_world.query(subj_vec)
+        concept_mix = subj_vec + act_vec + obj_vec + rel_ctx
+        concept_mix = self.rel_proj(concept_mix)
+        gate = self.rel_gate(concept_mix)
+        h_last = h_last + gate * concept_mix
 
+        h_last = h_last + self.adapter(h_last)
 
         query = self.wm_proj(h_last)
         if self._wm_state is None or self._wm_state.size(0) != B:
@@ -636,9 +641,8 @@ class LiquidLM(nn.Module):
         wm_read, self._wm_state = self.wm(query, wm_state=self._wm_state)
         h_last = h_last + wm_read
 
-
-        s4d_summary = x_ssm[:, -1, :]   
-        h_final = h_last + s4d_summary     
+        s4d_summary = x_ssm[:, -1, :]
+        h_final = h_last + s4d_summary
 
         h_final = self.ln(h_final)
         h_final = self.dropout(h_final)
@@ -646,6 +650,7 @@ class LiquidLM(nn.Module):
         conf = self.conf_net(h_final.detach(), logits.detach())
 
         return logits, conf, h_final
+
 
 class MirrorLM(nn.Module):
     def __init__(self, vocab_size, d_model=64, hidden_size=64, window=16):
