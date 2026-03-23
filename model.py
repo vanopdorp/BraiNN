@@ -482,7 +482,8 @@ class LiquidSelfAttention(nn.Module):
         k = self.phi(k)
 
         k_sum = k.sum(dim=1)
-        kv_sum = torch.einsum("bthd,bthv->bhdv", k, v)
+        kv_sum = torch.einsum("bthd,bthd->bhd", k, v)
+        kv_sum = kv_sum.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
 
         out = torch.einsum("bthd,bhdv->bthv", q, kv_sum)
         z = torch.einsum("bthd,bhd->bth", q, k_sum)
@@ -553,9 +554,27 @@ class S4DSSM(nn.Module):
 
         return torch.cat(outputs, dim=1)    
 
+class MambaBlock(nn.Module):
+    def __init__(self, d_model, d_state=128):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.in_proj = nn.Linear(d_model, d_model, bias=False)
+        self.ssm = S4DSSM(d_state=d_state, d_model=d_model)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        x_in = self.in_proj(x)
+        x_ssm = self.ssm(x_in)
+        x_out = x_in + x_ssm
+        x_out = self.out_proj(x_out)
+        x_out = self.norm(x_out)
+        return x_out
+
 
 class LiquidLM(nn.Module):
-    def __init__(self, vocab_size, d_model=64, hidden_size=64, window=16,num_layers=3):
+    def __init__(self, vocab_size, d_model=64, hidden_size=64, window=16, num_layers=3):
         super().__init__()
         assert d_model <= 768
         self.window = window
@@ -566,8 +585,9 @@ class LiquidLM(nn.Module):
 
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.attn = LiquidSelfAttention(d_model, num_heads=2)
-        self.num_layers = num_layers
-        self.gru = nn.GRU(input_size=d_model, hidden_size=hidden_size, num_layers=self.num_layers, batch_first=True)
+        self.pre_norm = nn.LayerNorm(d_model)
+        self.mamba_layers = nn.ModuleList([MambaBlock(d_model, d_state=128) for _ in range(num_layers)])
+
         self.ln = nn.LayerNorm(hidden_size)
         self.dropout = nn.Dropout(0.1)
         self.lm_head = nn.Linear(hidden_size, vocab_size)
@@ -586,9 +606,9 @@ class LiquidLM(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_size // 8, hidden_size)
         )
-        self.ssm = S4DSSM(d_state=128, d_model=d_model)
-        self.pre_norm = nn.LayerNorm(d_model)
         self.adapter.requires_grad_(False)
+
+        self.proj_to_hidden = nn.Linear(d_model, hidden_size)
 
     def grow_vocab(self, new_vocab_size, tok):
         old_vocab = self.lm_head.weight.data.shape[0]
@@ -609,8 +629,8 @@ class LiquidLM(nn.Module):
         self.lm_head = new_head
 
         self.conf_net = ConfidenceNet(self.hidden_size, new_vocab_size).to(device)
-
         tok.token2id = {tok.id2token[i]: i for i in range(len(tok.id2token))}
+
     def forward(self, input_ids):
         B, T = input_ids.shape
         device = input_ids.device
@@ -618,11 +638,12 @@ class LiquidLM(nn.Module):
         x = self.embedding(input_ids)
         x = self.attn(x)
         x = self.pre_norm(x)
-        x_ssm = self.ssm(x)
-        x = x + x_ssm
 
-        h0 = torch.zeros(self.num_layers, B, self.hidden_size, device=device)
-        gru_out, _ = self.gru(x, h0)
+        for layer in self.mamba_layers:
+            x = layer(x)
+
+        x_hidden = self.proj_to_hidden(x)
+        gru_out = x_hidden
         h_last = gru_out[:, -1, :]
 
         subj_vec, act_vec, obj_vec = self.concepts(gru_out)
@@ -641,7 +662,7 @@ class LiquidLM(nn.Module):
         wm_read, self._wm_state = self.wm(query, wm_state=self._wm_state)
         h_last = h_last + wm_read
 
-        s4d_summary = x_ssm[:, -1, :]
+        s4d_summary = x_hidden[:, -1, :]
         h_final = h_last + s4d_summary
 
         h_final = self.ln(h_final)
@@ -650,6 +671,7 @@ class LiquidLM(nn.Module):
         conf = self.conf_net(h_final.detach(), logits.detach())
 
         return logits, conf, h_final
+
 
 
 class MirrorLM(nn.Module):
