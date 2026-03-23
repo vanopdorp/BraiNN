@@ -745,7 +745,7 @@ def train_epoch(real_model, tok, corpus, device, window=16, scheduler=None, opt=
 
     scaler = GradScaler(device=device)
 
-    batch_size = 1024
+    batch_size = 128
     total_loss = 0.0
     n_batches = 0
 
@@ -951,8 +951,8 @@ def main():
 
     phases = [
         ("phase1_simple_svo", curriculum["phase1_simple_svo"], 16),
-        ("phase2_svo_adv", curriculum["phase2_svo_adv"], 16),
-        ("phase3_svo_prep_loc", curriculum["phase3_svo_prep_loc"], 16),
+        ("phase2_svo_adv", curriculum["phase2_svo_adv"], 10.5),
+        ("phase3_svo_prep_loc", curriculum["phase3_svo_prep_loc"],9),
         ("phase4_compound", curriculum["phase4_compound"], 16),
         ("phase5_stories", curriculum["phase5_stories"], 16),
     ]
