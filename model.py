@@ -407,11 +407,14 @@ class ConfidenceNet(nn.Module):
         self.act = nn.ReLU()
 
     def forward(self, h, logits):
-        probs = torch.softmax(logits, dim=-1)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
+        logits = logits.clamp(-20.0, 20.0)
+        probs = torch.softmax(logits.float(), dim=-1)
         x = torch.cat([h, probs], dim=-1)
         x = self.act(self.fc1(x))
         conf = torch.sigmoid(self.fc2(x))
         return conf
+
 
 
 class WorkingMemory(nn.Module):
@@ -634,11 +637,8 @@ class LiquidLM(nn.Module):
 
     def _run_attn(self, x):
         return self.attn(x)
-
     def forward(self, input_ids):
         B, T = input_ids.shape
-        device = input_ids.device
-
         x = self.embedding(input_ids)
 
         if self.use_checkpoint:
@@ -662,16 +662,26 @@ class LiquidLM(nn.Module):
 
         subj_vec, act_vec, obj_vec = self.concepts(gru_out)
         rel_ctx = self.rel_world.query(subj_vec)
+
         concept_mix = subj_vec + act_vec + obj_vec + rel_ctx
         concept_mix = self.rel_proj(concept_mix)
+
+        # hard guards
+        concept_mix = torch.nan_to_num(concept_mix, nan=0.0, posinf=1e4, neginf=-1e4)
+        concept_mix = torch.clamp(concept_mix, -20.0, 20.0)
+
         gate = self.rel_gate(concept_mix)
+        gate = torch.nan_to_num(gate, nan=0.0, posinf=1.0, neginf=0.0)
         h_last = h_last + gate * concept_mix
+
+        h_last = torch.nan_to_num(h_last, nan=0.0, posinf=1e4, neginf=-1e4)
+        h_last = torch.clamp(h_last, -50.0, 50.0)
 
         h_last = h_last + self.adapter(h_last)
 
         query = self.wm_proj(h_last)
         if self._wm_state is None or self._wm_state.size(0) != B:
-            self._wm_state = self.wm.init_state(B, device=device)
+            self._wm_state = self.wm.init_state(B, device=input_ids.device)
         self._wm_state = self._wm_state.detach().clone()
         wm_read, self._wm_state = self.wm(query, wm_state=self._wm_state)
         h_last = h_last + wm_read
@@ -679,9 +689,14 @@ class LiquidLM(nn.Module):
         s4d_summary = x_hidden[:, -1, :]
         h_final = h_last + s4d_summary
 
+        h_final = torch.nan_to_num(h_final, nan=0.0, posinf=1e4, neginf=-1e4)
+        h_final = torch.clamp(h_final, -50.0, 50.0)
+
         h_final = self.ln(h_final)
         h_final = self.dropout(h_final)
         logits = self.lm_head(h_final)
+
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
         conf = self.conf_net(h_final.detach(), logits.detach())
 
         return logits, conf, h_final
@@ -991,7 +1006,7 @@ def main():
 
     phases = [
         ("phase1_simple_svo", curriculum["phase1_simple_svo"], 19),
-        ("phase2_svo_adv", curriculum["phase2_svo_adv"], 13.3),
+        ("phase2_svo_adv", curriculum["phase2_svo_adv"], 13.8),
         ("phase3_svo_prep_loc", curriculum["phase3_svo_prep_loc"],323),
         ("phase4_compound", curriculum["phase4_compound"], 13.7),
         ("phase5_stories", curriculum["phase5_stories"], 16),
