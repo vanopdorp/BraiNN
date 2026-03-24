@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import json
 import multiprocessing as mp
+import torch.utils.checkpoint as cp
 from collections import Counter
 from torch.amp import autocast, GradScaler
 
@@ -571,10 +572,9 @@ class MambaBlock(nn.Module):
         x_out = self.out_proj(x_out)
         x_out = self.norm(x_out)
         return x_out
-
-
 class LiquidLM(nn.Module):
-    def __init__(self, vocab_size, d_model=64, hidden_size=64, window=16, num_layers=3):
+    def __init__(self, vocab_size, d_model=64, hidden_size=64, window=16, num_layers=3,
+                 use_checkpoint=True):
         super().__init__()
         assert d_model <= 768
         self.window = window
@@ -582,6 +582,7 @@ class LiquidLM(nn.Module):
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self._wm_state = None
+        self.use_checkpoint = use_checkpoint
 
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.attn = LiquidSelfAttention(d_model, num_heads=2)
@@ -631,16 +632,29 @@ class LiquidLM(nn.Module):
         self.conf_net = ConfidenceNet(self.hidden_size, new_vocab_size).to(device)
         tok.token2id = {tok.id2token[i]: i for i in range(len(tok.id2token))}
 
+    def _run_attn(self, x):
+        return self.attn(x)
+
     def forward(self, input_ids):
         B, T = input_ids.shape
         device = input_ids.device
 
         x = self.embedding(input_ids)
-        x = self.attn(x)
+
+        if self.use_checkpoint:
+            x = cp.checkpoint(self._run_attn, x)
+        else:
+            x = self.attn(x)
+
         x = self.pre_norm(x)
 
         for layer in self.mamba_layers:
-            x = layer(x)
+            if self.use_checkpoint:
+                def layer_forward(x, layer=layer):
+                    return layer(x)
+                x = cp.checkpoint(layer_forward, x)
+            else:
+                x = layer(x)
 
         x_hidden = self.proj_to_hidden(x)
         gru_out = x_hidden
@@ -1038,6 +1052,14 @@ def main():
                 break
             reset_rel_world(real_model)
             real_model._wm_state = None
+            torch.cuda.empty_cache()
+            real_model.rel_world.node_reprs = real_model.rel_world.node_reprs[:0]
+            real_model.rel_world.edge_src = real_model.rel_world.edge_src[:0]
+            real_model.rel_world.edge_dst = real_model.rel_world.edge_dst[:0]
+            real_model.rel_world.edge_rel = real_model.rel_world.edge_rel[:0]
+            real_model.rel_world.edge_conf = real_model.rel_world.edge_conf[:0]
+            real_model.rel_world.node_ids = []
+
 
         sample_prompt = phase_data[0].split()[0] + " "
         gen = test_generation(real_model, tok, sample_prompt, device_real)
