@@ -11,6 +11,8 @@ import torch.utils.checkpoint as cp
 from collections import Counter
 from torch.amp import autocast, GradScaler
 import os
+import requests
+import zipfile
 
 def export_model_state(tok, real_model, hippocampus, filename="model_export.json"):
     export_data = {}
@@ -933,26 +935,34 @@ def compute_accuracy(model, X, Y, device):
     return acc
 
 
-import requests
-import zipfile
-import json
 
-def load_dailydialog_turns():
+def load_dailydialog_instruct():
     path = "/kaggle/working/dailydialog/data/dialogues.json"
 
-    print("Loading dialogues.json…")
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    dialogs = []
-    for dialog in data:
-        for turn in dialog["turns"]:
-            utt = turn["utterance"].strip()
-            if utt:
-                dialogs.append(utt)
+    instruct_samples = []
 
-    print(f"Loaded {len(dialogs)} dialogue turns.")
-    return dialogs
+    for dialog in data:
+        turns = dialog["turns"]
+
+        for i in range(len(turns) - 1):
+            u1 = turns[i]
+            u2 = turns[i + 1]
+
+            if u1["speaker"] == "user" and u2["speaker"] == "system":
+                instruct_samples.append({
+                    "user": u1["utterance"].strip(),
+                    "assistant": u2["utterance"].strip()
+                })
+
+    return instruct_samples
+
+
+def flatten_instruct(sample, system_prompt):
+    return f"<system>{system_prompt}</system><user>{sample['user']}</user><answer>{sample['assistant']}</answer"
+
 
 def download_dailydialog_turns():
     url = "https://huggingface.co/datasets/ConvLab/dailydialog/resolve/main/data.zip?download=true"
@@ -974,6 +984,9 @@ def download_dailydialog_turns():
             zip_ref.extractall(extract_dir)
 
 
+SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and politely."
+
+
 def main():
 
 
@@ -987,11 +1000,10 @@ def main():
         device_real = torch.device("cpu")
         device_mirror = torch.device("cpu")
 
-    # Load dataset
     download_dailydialog_turns()
-    dialogs = load_dailydialog_turns()
+    dialogs_raw = load_dailydialog_instruct()
+    dialogs = [flatten_instruct(s, SYSTEM_PROMPT) for s in dialogs_raw]
 
-    # Tokenizer + models
     tok = DynamicTokenizer()
     vocab_size = 120
     size = 512
@@ -1059,7 +1071,7 @@ def main():
     for epoch in range(max_epochs):
         loss = train_epoch(real_model, tok, dialogs, device_real,
                            seq_len=window, lr=lr, opt=opt)
-        if loss[0] < 0.9:
+        if loss[0] < 0.5:
             break
         ppl = test_perplexity(real_model, tok, dialogs, device_real)
         print(f"chatbot_phase | epoch {epoch+1}/{max_epochs} | loss={loss[0]:.2f} | ppl={ppl:.2f}")
