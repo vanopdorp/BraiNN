@@ -630,11 +630,13 @@ class LiquidLM(nn.Module):
         self.rel_gate = RelationalGate(hidden_size)
         self.rel_proj = nn.Linear(hidden_size, hidden_size)
         self.conf_net = ConfidenceNet(hidden_size, vocab_size)
+        b = self.hidden_size // 4
         self.adapter = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 8),
-            SwiGLU(),
-            nn.Linear(hidden_size // 8, hidden_size)
+            nn.Linear(hidden_size, b),
+            nn.SiLU(),
+            nn.Linear(b, hidden_size)
         )
+
         self.adapter.requires_grad_(False)
         self.proj_to_hidden = nn.Linear(d_model, hidden_size)
 
@@ -964,6 +966,8 @@ def download_dailydialog_turns():
 
 
 SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and politely."
+def count_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def main():
     if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
@@ -1007,6 +1011,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=2000)
 
     encoded = [torch.tensor(tok.encode(s), dtype=torch.long) for s in dialogs]
+    print("parameters:", count_params(real_model))
 
     split = int(0.9 * len(encoded))
     train_data = encoded[:split]
