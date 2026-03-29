@@ -700,7 +700,7 @@ class LiquidLM(nn.Module):
 
         wm_read, self._wm_state = self.wm(
             query=concept_mix,
-            wm_state=self._wm_state
+            wm_state=None
         )
         wm_read = self.wm_proj(wm_read)
         rel_enhanced = rel_enhanced + wm_read.unsqueeze(1)
