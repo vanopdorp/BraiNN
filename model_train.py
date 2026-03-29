@@ -552,7 +552,7 @@ class MambaBlock(nn.Module):
         self.in_proj = nn.Linear(d_model, d_model, bias=False)
         self.ssm = S4DSSM(d_state=d_state, d_model=d_model)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = RMSNorm(d_model)
 
     def forward(self, x):
         x_in = self.in_proj(x)
@@ -618,9 +618,9 @@ class LiquidLM(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.attn = LiquidSelfAttention(d_model, num_heads=2)
-        self.pre_norm = nn.LayerNorm(d_model)
+        self.pre_norm = RMSNorm(d_model)
         self.mamba_layers = nn.ModuleList([MambaBlock(d_model, d_state=128) for _ in range(num_layers)])
-        self.ln = nn.LayerNorm(hidden_size)
+        self.ln = RMSNorm(hidden_size)
         self.dropout = nn.Dropout(0.1)
         self.lm_head = nn.Linear(hidden_size, vocab_size)
         self.wm = WorkingMemory(num_slots=16, slot_dim=hidden_size)
