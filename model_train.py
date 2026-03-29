@@ -981,7 +981,7 @@ def main():
 
     size = 512
     context = 128
-    lr = 5e-4
+    lr = 2e-4
     batch_size = 64
     max_epochs = 3
 
