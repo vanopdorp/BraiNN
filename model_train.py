@@ -49,6 +49,9 @@ class DynamicTokenizer:
     @property
     def pad_id(self):
         return self.token2id["<pad>"]
+    @property
+    def vocab_size_actual(self):
+        return len(self.token2id)
 
     def observe(self, text):
         for word in text.strip().split():
@@ -659,7 +662,7 @@ def learn_new_sentence(real_model, mirror_model, hippocampus,
                        sentence, tok, window=16, device="cpu",
                        adapter_steps=50, alpha=1.0):
 
-    new_tokens = tok.observe_sentence(sentence)
+    new_tokens = tok.observe(sentence)
     if new_tokens:
         new_vocab = tok.vocab_size_actual
         real_model.grow_vocab(new_vocab, tok)
@@ -812,7 +815,7 @@ def main():
 
     tok = DynamicTokenizer()
     for s in dialogs:
-        tok.observe_sentence(s)
+        tok.observe(s)
     vocab_size = tok.vocab_size_actual
 
     size = 512
@@ -821,7 +824,7 @@ def main():
     batch_size = 64
     max_epochs = 3
 
-    real_model = LiquidLM(vocab_size, size, size, context).to(device_real)
+    real_model = LiquidLM(vocab_size, size, context).to(device_real)
     mirror_model = MirrorLM(vocab_size, size, size, context).to(device_mirror)
     hippocampus = Hippocampus(max_episodes=size).to(device_real)
 
