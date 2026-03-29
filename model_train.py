@@ -630,12 +630,8 @@ class LiquidLM(nn.Module):
         self.rel_gate = RelationalGate(hidden_size)
         self.rel_proj = nn.Linear(hidden_size, hidden_size)
         self.conf_net = ConfidenceNet(hidden_size, vocab_size)
-        b = self.hidden_size // 4
-        self.adapter = nn.Sequential(
-            nn.Linear(hidden_size, b),
-            nn.SiLU(),
-            nn.Linear(b, hidden_size)
-        )
+        self.adapter = SwiGLU(hidden_size, 4 * hidden_size)
+
 
         self.adapter.requires_grad_(False)
         self.proj_to_hidden = nn.Linear(d_model, hidden_size)
