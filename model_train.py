@@ -707,7 +707,7 @@ class LiquidLM(nn.Module):
 
         logits = self.lm_head(rel_enhanced)
         conf = self.conf_net(rel_enhanced[:, -1, :], logits[:, -1, :])
-        return logits, conf, self._wm_state
+        return logits
 
 
 class MirrorLM(nn.Module):
