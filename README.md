@@ -53,7 +53,7 @@ The model can learn new sentences on the fly, expand its vocabulary, and update 
 
 ---
 
-## 📦 Components Overview
+##  Components Overview
 
 - **DynamicTokenizer**  
   Builds a hybrid character/subword/word vocabulary that grows during training.
