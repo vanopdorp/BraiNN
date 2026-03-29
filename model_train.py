@@ -631,6 +631,7 @@ class LiquidLM(nn.Module):
         self.rel_proj = nn.Linear(hidden_size, hidden_size)
         self.conf_net = ConfidenceNet(hidden_size, vocab_size)
         self.adapter = SwiGLU(hidden_size, 4 * hidden_size)
+        self.swiglu = SwiGLU(hidden_size, 4 * hidden_size)
 
 
         self.adapter.requires_grad_(False)
@@ -675,6 +676,7 @@ class LiquidLM(nn.Module):
                 x = layer(x)
         h = self.proj_to_hidden(x)
         h = self.ln(h)
+        h = self.swiglu(h)
         h = self.dropout(h)
         logits = self.lm_head(h)
         return logits
