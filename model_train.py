@@ -592,6 +592,18 @@ class RMSNorm(nn.Module):
         norm = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         return self.weight * x * norm
 
+class SwiGLU(nn.Module):
+    def __init__(self, dim, hidden_dim):
+        super().__init__()
+        self.w1 = nn.Linear(dim, hidden_dim)
+        self.w2 = nn.Linear(dim, hidden_dim)
+        self.w3 = nn.Linear(hidden_dim, dim)
+
+    def forward(self, x):
+        a = self.w1(x)
+        b = self.w2(x)
+        x = F.silu(a) * b
+        return self.w3(x)
 
 class LiquidLM(nn.Module):
     def __init__(self, vocab_size, d_model=64, hidden_size=64, window=16, num_layers=4,
@@ -620,7 +632,7 @@ class LiquidLM(nn.Module):
         self.conf_net = ConfidenceNet(hidden_size, vocab_size)
         self.adapter = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 8),
-            nn.ReLU(),
+            SwiGLU(),
             nn.Linear(hidden_size // 8, hidden_size)
         )
         self.adapter.requires_grad_(False)
