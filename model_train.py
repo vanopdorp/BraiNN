@@ -173,7 +173,7 @@ class RelationalWorldModel(nn.Module):
         super().__init__()
         self.dim = dim
         self.max_nodes = max_nodes
-        self.ttl = ttl
+        self.ttl = ttls
 
         self.register_buffer("nodes", torch.zeros(0, dim))
         self.node_ttl = []
@@ -183,38 +183,23 @@ class RelationalWorldModel(nn.Module):
         self.act = nn.Tanh()
 
     def _add_node(self, vec):
+
+        if vec.dim() == 1:
+            vec = vec.unsqueeze(0)      
+        elif vec.dim() == 3:
+            vec = vec.mean(dim=0)      
+
         if self.nodes.size(0) >= self.max_nodes:
             self.nodes = self.nodes[1:]
             self.node_ttl = self.node_ttl[1:]
 
-        self.nodes = torch.cat([self.nodes, vec], dim=0)
+        self.nodes = torch.cat([self.nodes, vec.to(self.nodes.device)], dim=0)
         self.node_ttl.append(self.ttl)
 
     def store(self, subj, rel, obj):
-        vec = (subj + rel + obj).mean(dim=0, keepdim=True)
+        vec = subj + rel + obj
+        vec = vec.mean(dim=0)  
         self._add_node(vec)
-
-    def decay(self):
-        new_nodes = []
-        new_ttl = []
-        for node, t in zip(self.nodes, self.node_ttl):
-            if t > 1:
-                new_nodes.append(node.unsqueeze(0))
-                new_ttl.append(t - 1)
-        if new_nodes:
-            self.nodes = torch.cat(new_nodes, dim=0)
-            self.node_ttl = new_ttl
-        else:
-            self.nodes = torch.zeros(0, self.dim, device=self.nodes.device)
-            self.node_ttl = []
-
-    def query(self, vec):
-        if self.nodes.size(0) == 0:
-            return torch.zeros_like(vec)
-
-        sims = F.cosine_similarity(vec, self.nodes)
-        idx = sims.argmax().item()
-        return self.nodes[idx:idx+1]
 
 
 class RelationalGate(nn.Module):
@@ -818,10 +803,10 @@ def main():
         tok.observe(s)
     vocab_size = tok.vocab_size_actual
 
-    size = 512
+    size = 256
     context = 128
     lr = 2e-4
-    batch_size = 64
+    batch_size = 8
     max_epochs = 3
 
     real_model = LiquidLM(vocab_size, size, context).to(device_real)
