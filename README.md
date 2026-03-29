@@ -1,120 +1,88 @@
-# BraiNN
-A Neural Network with Working Memory, Relational Reasoning, and Adaptive Learning
+# BraiNN  
+An Experimental Neural Architecture with Working Memory, Relational Reasoning, and Adaptive Learning
 
-BraiNN is an experimental neural architecture designed to go beyond standard language models.  
-It integrates working memory, relational reasoning, concept extraction, and online learning into a compact and efficient system.  
-The goal is to create a model that not only predicts text, but also **remembers**, **adapts**, and **understands structure** in a more human‑like way.
+BraiNN is a compact research‑oriented neural network that blends multiple cognitive‑inspired components into a single architecture. It is designed to move beyond standard language modeling by integrating mechanisms for memory, relational structure, concept extraction, and fast online adaptation. The goal is to explore models that not only generate text, but also **store**, **organize**, **reason**, and **learn** during interaction.
 
 ---
 
-## Features
+## Core Capabilities
 
-### **• RWKV‑style LiquidSelfAttention**
-A recurrent attention mechanism that scales linearly with sequence length.  
-No quadratic memory usage, no large attention matrices, and stable performance on long sequences.
+### Working Memory
+A differentiable memory module with multiple slots, soft addressing, gated writing, and persistent state. It allows the model to maintain information across steps, enabling multi‑step reasoning and contextual continuity.
 
-### **• Multi‑Layer GRU Backbone**
-A stacked GRU encoder that processes token sequences and produces robust hidden representations.
+### Relational World Model
+A lightweight graph‑based system that stores subject–action–object triples extracted from hidden states. Nodes decay over time, and the model retrieves relational context using similarity‑based querying. This provides a structured knowledge layer that evolves dynamically.
 
-### **• S4D State-Space Module**
-A lightweight state‑space model that captures long‑range temporal structure and complements the GRU.
+### Concept Extraction
+A learned mechanism that separates hidden representations into **subject**, **action**, and **object** components using attention‑like weighting. These concepts feed into the relational memory and working memory.
 
-### **• Working Memory Module**
-A differentiable memory system with:
-- multiple memory slots  
-- soft addressing  
-- gated writing  
-- persistent state across steps  
+### Liquid Self‑Attention
+A recurrent, RWKV‑style attention mechanism with linear complexity. It replaces quadratic attention and supports long sequences efficiently.
 
-This allows BraiNN to store and retrieve information beyond the immediate context window.
+### S4D State‑Space Module
+A compact state‑space layer that captures long‑range temporal patterns and complements the attention and GRU components.
 
-### **• ConceptExtractor**
-Extracts subject, action, and object representations from token sequences using learned attention weights.
+### MirrorLM for Fast Learning
+A secondary lightweight model that tracks prediction errors and adapts rapidly. It supports meta‑learning signals, fast‑weights, and online updates without destabilizing the main model.
 
-### **• RelationalWorldModel**
-Builds a dynamic graph of entities and relations:
-- nodes represent concepts  
-- edges represent learned relationships  
-- message passing refines relational context  
-
-This enables BraiNN to accumulate structured knowledge over time.
-
-### **• Confidence Network**
-Predicts the model’s confidence in its own output, enabling:
-- uncertainty estimation  
-- adaptive learning  
-- selective memory updates  
-
-### **• Hippocampus Memory Buffer**
-Stores high‑priority sentences for replay and consolidation, inspired by biological memory systems.
-
-### **• Online Learning Support**
-The model can learn new sentences on the fly, expand its vocabulary, and update its internal memory without full retraining.
+### Hippocampus Memory Buffer
+A prioritized replay buffer that stores surprising or important sentences. It supports consolidation, continual learning, and long‑term retention.
 
 ---
 
-##  Components Overview
+## Architecture Overview
 
 - **DynamicTokenizer**  
-  Builds a hybrid character/subword/word vocabulary that grows during training.
-
-- **LiquidSelfAttention**  
-  RWKV‑style recurrent attention with time‑mixing and gating.
-
-- **WorkingMemory**  
-  Differentiable memory with soft attention and gated writes.
-
-- **RelationalWorldModel**  
-  Graph‑based relational reasoning with message passing.
-
-- **ConceptExtractor**  
-  Learns to extract semantic roles from sequences.
+  Hybrid character/subword tokenizer that grows with new observations.
 
 - **LiquidLM**  
-  The main language model combining all modules.
+  The main model combining embeddings, liquid attention, S4D blocks, concept extraction, relational memory, working memory, and a language‑modeling head.
 
 - **MirrorLM**  
-  A secondary model used for meta‑learning and stability checks.
+  A fast‑adapting auxiliary model with meta‑learning signals and fast‑weight updates.
+
+- **RelationalWorldModel**  
+  A dynamic graph of concept nodes with decay, storage, and retrieval.
+
+- **WorkingMemory**  
+  Slot‑based differentiable memory with read/write operations.
+
+- **Hippocampus**  
+  Episodic memory with priority‑based sampling.
 
 ---
 
-## Training
+## Training Workflow
 
-BraiNN use:
-- curriculum learning  
-- online learning  
-- memory consolidation  
-- adaptive learning rates  
-- GPU or CPU training  
-
-Training is performed in phases, gradually increasing linguistic complexity.
+- Tokenize and encode dialogue data  
+- Train LiquidLM with AdamW and cosine annealing  
+- Periodically evaluate on held‑out sequences  
+- Generate text using autoregressive sampling  
+- Export working memory, vocabulary, and hippocampus state  
+- Optionally consolidate memory or perform online learning with MirrorLM
 
 ---
 
-## Example Use Cases
+## Example Applications
 
-- small language models with memory  
-- continual learning experiments  
-- reasoning over entities and relations   
-- research on compact LM designs  
+- Compact language models with persistent memory  
+- Continual learning and online adaptation experiments  
+- Research on relational reasoning and concept extraction  
+- Cognitive‑inspired architectures and hybrid neural systems  
+- Small‑scale LM research without massive compute requirements
 
 ---
 
 ## Requirements
 
-- Python 3 
+- Python 3  
 - PyTorch  
-- CUDA (optional)  
+- CUDA (optional but recommended)
 
 ---
 
-## License
+## Project Status
 
-MIT License (or your preferred license)
+BraiNN is an active experimental project.  
+Expect rapid iteration, architectural changes, and ongoing exploration of memory‑augmented neural systems.
 
----
-
-## Status
-
-BraiNN is an active research project.  
-Expect rapid changes, experimental features, and ongoing improvements.
