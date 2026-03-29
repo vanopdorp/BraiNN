@@ -173,7 +173,7 @@ class RelationalWorldModel(nn.Module):
         super().__init__()
         self.dim = dim
         self.max_nodes = max_nodes
-        self.ttl = ttls
+        self.default_ttl = ttl
 
         self.register_buffer("nodes", torch.zeros(0, dim))
         self.node_ttl = []
@@ -181,26 +181,45 @@ class RelationalWorldModel(nn.Module):
         self.W_msg = nn.Linear(dim * 2, dim)
         self.W_self = nn.Linear(dim, dim)
         self.act = nn.Tanh()
+    def query(self, vec, k=4):
+        if self.nodes.size(0) == 0:
+            return torch.zeros(self.dim, device=self.nodes.device)
+        if vec.dim() == 3:
+            vec = vec.mean(dim=0)
+        if vec.dim() == 2:
+            vec = vec.squeeze(0)
+        scores = torch.matmul(self.nodes, vec.to(self.nodes.device))
+        topk = torch.topk(scores, min(k, scores.size(0)), dim=0).indices
+        ctx = self.nodes[topk].mean(dim=0)
+        return ctx
 
     def _add_node(self, vec):
-
         if vec.dim() == 1:
-            vec = vec.unsqueeze(0)      
+            vec = vec.unsqueeze(0)
         elif vec.dim() == 3:
-            vec = vec.mean(dim=0)      
+            vec = vec.mean(dim=0)
 
         if self.nodes.size(0) >= self.max_nodes:
             self.nodes = self.nodes[1:]
             self.node_ttl = self.node_ttl[1:]
 
         self.nodes = torch.cat([self.nodes, vec.to(self.nodes.device)], dim=0)
-        self.node_ttl.append(self.ttl)
+        self.node_ttl.append(self.default_ttl)
 
     def store(self, subj, rel, obj):
         vec = subj + rel + obj
-        vec = vec.mean(dim=0)  
+        vec = vec.mean(dim=0)
         self._add_node(vec)
 
+    def decay(self):
+        if len(self.node_ttl) == 0:
+            return
+
+        self.node_ttl = [t - 1 for t in self.node_ttl]
+        mask = torch.tensor([t > 0 for t in self.node_ttl], device=self.nodes.device)
+
+        self.nodes = self.nodes[mask]
+        self.node_ttl = [t for t in self.node_ttl if t > 0]
 
 class RelationalGate(nn.Module):
     def __init__(self, hidden_size):
@@ -488,7 +507,7 @@ class LiquidLM(nn.Module):
         mix = mix + self.wm_proj(wm_read).unsqueeze(1)
 
         logits = self.lm_head(mix)
-        return logits, wm_state
+        return logits
 
 
 class MirrorLM(nn.Module):
@@ -806,7 +825,7 @@ def main():
     size = 256
     context = 128
     lr = 2e-4
-    batch_size = 8
+    batch_size = 16
     max_epochs = 3
 
     real_model = LiquidLM(vocab_size, size, context).to(device_real)
