@@ -582,6 +582,15 @@ def build_sequences_sp(corpus, tok, seq_len=64, max_sequences=2000000):
     targets = X[:, 1:]
     return inputs, targets
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-8):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        norm = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return self.weight * x * norm
 
 
 class LiquidLM(nn.Module):
@@ -672,7 +681,7 @@ class MirrorLM(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.attn = LiquidSelfAttention(d_model, num_heads=2)
         self.liquid = LiquidGRUCell(d_model, hidden_size)
-        self.ln = nn.LayerNorm(hidden_size)
+        self.ln = RMSNorm(hidden_size)
         self.dropout = nn.Dropout(0.1)
         self.lm_head = nn.Linear(hidden_size, vocab_size)
 
@@ -867,13 +876,6 @@ def learn_new_sentence(real_model, mirror_model, hippocampus,
         probs = torch.softmax(logits_new, dim=-1)
         surpr = 1.0 - probs.gather(1, Y_new.unsqueeze(1)).mean().item()
         hippocampus.store(sentence, float(surpr ** 2))
-def reset_rel_world(model):
-    rw = model.rel_world
-    rw.node_reprs = torch.empty(0, model.hidden_size, device=rw.W_msg.weight.device)
-    rw.edge_src  = torch.empty(0, dtype=torch.long, device=rw.W_msg.weight.device)
-    rw.edge_dst  = torch.empty(0, dtype=torch.long, device=rw.W_msg.weight.device)
-    rw.edge_rel  = torch.empty(0, model.hidden_size, device=rw.W_msg.weight.device)
-    rw.edge_conf = torch.empty(0, 1, device=rw.W_msg.weight.device)
 
 def compute_accuracy(model, X, Y, device):
     model.eval()
@@ -994,6 +996,10 @@ def main():
 
     encoded = [torch.tensor(tok.encode(s), dtype=torch.long) for s in dialogs]
 
+    split = int(0.9 * len(encoded))
+    train_data = encoded[:split]
+    test_data = encoded[split:]
+
     def make_batches(data, bs):
         random.shuffle(data)
         batch = []
@@ -1004,8 +1010,34 @@ def main():
                 batch = []
         if batch:
             yield batch
+
+    def eval_loss(model, data, device, batch_size=64):
+        model.eval()
+        total_loss = 0
+        count = 0
+        with torch.no_grad():
+            for batch in make_batches(data, batch_size):
+                lens = [len(x) for x in batch]
+                m = max(lens)
+                x = torch.zeros(len(batch), m, dtype=torch.long)
+                y = torch.zeros(len(batch), m, dtype=torch.long)
+                for i, seq in enumerate(batch):
+                    x[i, :len(seq)] = seq
+                    y[i, :len(seq)-1] = seq[1:]
+                    y[i, len(seq)-1] = seq[-1]
+                x = x.to(device)
+                y = y.to(device)
+                logits = model(x)
+                logits = logits.reshape(-1, logits.size(-1))
+                y = y.reshape(-1)
+                loss = F.cross_entropy(logits, y)
+                total_loss += loss.item()
+                count += 1
+        return total_loss / count
+
     for epoch in range(max_epochs):
-        for batch_i, batch in enumerate(make_batches(encoded, batch_size)):
+        real_model.train()
+        for batch_i, batch in enumerate(make_batches(train_data, batch_size)):
             lens = [len(x) for x in batch]
             m = max(lens)
             x = torch.zeros(len(batch), m, dtype=torch.long)
@@ -1025,9 +1057,13 @@ def main():
             opt.step()
 
             if batch_i % 10 == 0:
-                print(f"epoch {epoch+1}/{max_epochs} | batch {batch_i} | loss={loss.item():.4f}")
-
+                print(f"epoch {epoch+1}/{max_epochs} | batch {batch_i} | train_loss={loss.item():.4f}")
+            if batch_i % 100 == 0:
+                test_loss = eval_loss(real_model, test_data, device_real, batch_size)
+                print("test loss:",test_loss)
         scheduler.step()
+        test_loss = eval_loss(real_model, test_data, device_real, batch_size)
+        print(f"epoch {epoch+1} | test_loss={test_loss:.4f}")
 
     def generate(model, tok, prompt, device, max_new=40, seq_len=128):
         model.eval()
