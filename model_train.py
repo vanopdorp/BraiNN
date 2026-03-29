@@ -582,39 +582,7 @@ def build_sequences_sp(corpus, tok, seq_len=64, max_sequences=2000000):
     targets = X[:, 1:]
     return inputs, targets
 
-def train_epoch(model, tok, corpus, device, seq_len=64, opt=None, lr=1e-4, batch_size=64):
-    model.train()
-    X, Y = build_sequences_sp(corpus, tok, seq_len=seq_len)
-    if X.numel() == 0:
-        return 0.0, opt
-    X = X.to(device)
-    Y = Y.to(device)
-    if opt is None:
-        opt = optim.AdamW(model.parameters(), lr=lr)
-    n = X.size(0)
-    perm = torch.randperm(n, device=device)
-    X = X[perm]
-    Y = Y[perm]
-    total_loss = 0.0
-    n_batches = 0
-    for i in range(0, n, batch_size):
-        xb = X[i:i+batch_size]
-        yb = Y[i:i+batch_size]
-        opt.zero_grad()
-        logits = model(xb)
-        vocab_dim = logits.size(-1)
-        logits = logits.reshape(-1, vocab_dim)
-        yb = yb.reshape(-1)
-        loss = F.cross_entropy(logits, yb)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-        total_loss += loss.item()
-        n_batches += 1
-        if i % (batch_size * 20) == 0:
-            print(f"batch {i}/{n} | loss={loss.item():.4f}")
 
-    return total_loss / max(1, n_batches), opt
 
 class LiquidLM(nn.Module):
     def __init__(self, vocab_size, d_model=64, hidden_size=64, window=16, num_layers=4,
@@ -960,9 +928,6 @@ def load_dailydialog_instruct():
     return instruct_samples
 
 
-def flatten_instruct(sample, system_prompt):
-    return f"<system>{system_prompt}</system><user>{sample['user']}</user><answer>{sample['assistant']}</answer"
-
 
 def download_dailydialog_turns():
     url = "https://huggingface.co/datasets/ConvLab/dailydialog/resolve/main/data.zip?download=true"
@@ -986,10 +951,7 @@ def download_dailydialog_turns():
 
 SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and politely."
 
-
 def main():
-
-
     if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
         device_real = torch.device("cuda:0")
         device_mirror = torch.device("cuda:1")
@@ -1001,14 +963,27 @@ def main():
         device_mirror = torch.device("cpu")
 
     download_dailydialog_turns()
-    dialogs_raw = load_dailydialog_instruct()
-    dialogs = [flatten_instruct(s, SYSTEM_PROMPT) for s in dialogs_raw]
+    raw = load_dailydialog_instruct()
+
+    def fmt(s):
+        return (
+            "<|system|>\nYou are a helpful assistant.\n"
+            "<|user|>\n" + s["user"] + "\n"
+            "<|assistant|>\n" + s["assistant"] + "\n"
+        )
+
+    dialogs = [fmt(x) for x in raw]
 
     tok = DynamicTokenizer()
-    vocab_size = 120
+    for s in dialogs:
+        tok.observe_sentence(s)
+    vocab_size = tok.vocab_size_actual
+
     size = 512
-    context = 64
+    context = 128
     lr = 5e-4
+    batch_size = 64
+    max_epochs = 3
 
     real_model = LiquidLM(vocab_size, size, size, context).to(device_real)
     mirror_model = MirrorLM(vocab_size, size, size, context).to(device_mirror)
@@ -1017,78 +992,60 @@ def main():
     opt = optim.AdamW(real_model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=2000)
 
-    max_epochs = 3
-    window = 128
-    def test_generation(model, tok, prompt, device, max_new_tokens=30, seq_len=128):
+    encoded = [torch.tensor(tok.encode(s), dtype=torch.long) for s in dialogs]
+
+    def make_batches(data, bs):
+        random.shuffle(data)
+        batch = []
+        for x in data:
+            batch.append(x)
+            if len(batch) == bs:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+    for epoch in range(max_epochs):
+        for batch_i, batch in enumerate(make_batches(encoded, batch_size)):
+            lens = [len(x) for x in batch]
+            m = max(lens)
+            x = torch.zeros(len(batch), m, dtype=torch.long)
+            y = torch.zeros(len(batch), m, dtype=torch.long)
+            for i, seq in enumerate(batch):
+                x[i, :len(seq)] = seq
+                y[i, :len(seq)-1] = seq[1:]
+                y[i, len(seq)-1] = seq[-1]
+            x = x.to(device_real)
+            y = y.to(device_real)
+            logits = real_model(x)
+            logits = logits.reshape(-1, logits.size(-1))
+            y = y.reshape(-1)
+            loss = F.cross_entropy(logits, y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            if batch_i % 10 == 0:
+                print(f"epoch {epoch+1}/{max_epochs} | batch {batch_i} | loss={loss.item():.4f}")
+
+        scheduler.step()
+
+    def generate(model, tok, prompt, device, max_new=40, seq_len=128):
         model.eval()
-        ids = tok.encode(prompt)
-        ids = ids[-seq_len:]
-        for _ in range(max_new_tokens):
+        ids = tok.encode(prompt)[-seq_len:]
+        for _ in range(max_new):
             x = torch.tensor([ids], dtype=torch.long, device=device)
             with torch.no_grad():
                 logits = model(x)
-            next_id = int(logits[0, -1].argmax().item())
-            ids.append(next_id)
+            nid = int(logits[0, -1].argmax().item())
+            ids.append(nid)
             ids = ids[-seq_len:]
         return tok.decode(ids)
 
-    def test_perplexity(model, tok, data, device, seq_len=128, batch_size=64, max_batches=200):
-        model.eval()
-        X, Y = build_sequences_sp(data, tok, seq_len=seq_len)
-        if X.numel() == 0:
-            return float("inf")
-        X = X.to(device)
-        Y = Y.to(device)
-        total_loss = 0.0
-        n_batches = 0
-        with torch.no_grad():
-            for i in range(0, X.size(0), batch_size):
-                xb = X[i:i+batch_size]
-                yb = Y[i:i+batch_size]
-                logits = model(xb)
-                vocab_dim = logits.size(-1)
-                logits = logits.reshape(-1, vocab_dim)
-                yb = yb.reshape(-1)
-                loss = F.cross_entropy(logits, yb)
-                total_loss += loss.item()
-                n_batches += 1
-                if n_batches >= max_batches:
-                    break
-        return math.exp(total_loss / n_batches)
+    out = generate(real_model, tok, "<|user|>\nHello\n<|assistant|>\n", device_real)
+    print(out)
 
-
-    # Training
-    print("\n=== Training chatbot_phase ===")
-
-    new_tokens = tok.observe_sentence(" ".join(dialogs))
-    if new_tokens:
-        new_vocab_size = tok.vocab_size_actual
-        real_model.grow_vocab(new_vocab_size, tok)
-        mirror_model.grow_vocab(new_vocab_size)
-        real_model.to(device_real)
-        mirror_model.to(device_mirror)
-
-    for epoch in range(max_epochs):
-        loss = train_epoch(real_model, tok, dialogs, device_real,
-                           seq_len=window, lr=lr, opt=opt)
-        if loss[0] < 0.5:
-            break
-        ppl = test_perplexity(real_model, tok, dialogs, device_real)
-        print(f"chatbot_phase | epoch {epoch+1}/{max_epochs} | loss={loss[0]:.2f} | ppl={ppl:.2f}")
-
-        real_model._wm_state = None
-        reset_rel_world(real_model)
-        torch.cuda.empty_cache()
-
-    # Test generation
-    prompt = "Hello, how are you"
-    out = test_generation(real_model, tok, prompt, device_real)
-    print(f"\nChatbot test: '{prompt}' → '{out}'")
-
-    # Save
     export_model_state(tok, real_model, hippocampus, filename="model_export.json")
-    torch.save(real_model.state_dict(), "model.pth")
-    print("Model saved as model.pth")
+    torch.save({"model": real_model.state_dict(), "tokenizer": tok}, "model.pth")
 
 if __name__ == "__main__":
     main()

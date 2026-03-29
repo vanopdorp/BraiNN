@@ -4,6 +4,8 @@ from model_train import LiquidLM, DynamicTokenizer
 import torch.serialization
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and politely."
+
 
 torch.serialization.add_safe_globals([DynamicTokenizer])
 
@@ -20,7 +22,7 @@ def load_model(tok, model_state):
         vocab_size=len(tok.token2id),
         d_model=512,
         hidden_size=512,
-        window=128,
+        window=64,
         num_layers=4,
         use_checkpoint=False
     )
@@ -86,11 +88,10 @@ def chat():
         if user.lower() in ["exit", "quit", "stop"]:
             break
 
-
         full_prompt = (
-            f"<system>{SYSTEM_PROMPT}</system> "
-            f"<user>{user}</user> "
-            f"<answer>"
+            f"<|system|>\n{SYSTEM_PROMPT}\n"
+            f"<|user|>\n{user}\n"
+            f"<|assistant|>\n"
         )
 
         reply = generate(model, tok, full_prompt)
