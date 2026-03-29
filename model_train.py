@@ -34,170 +34,101 @@ def export_model_state(tok, real_model, hippocampus, filename="model_export.json
 
     print(f"Model state exported to {filename}")
 
-
 class DynamicTokenizer:
-    def __init__(self, min_subword_freq=10, min_word_freq=3):
+    def __init__(self, min_freq=2, max_vocab=50000):
+        self.min_freq = min_freq
+        self.max_vocab = max_vocab
+
         self.special_tokens = ["<pad>", "<unk>"]
         self.token2id = {t: i for i, t in enumerate(self.special_tokens)}
         self.id2token = {i: t for t, i in self.token2id.items()}
-        self.char2id = {}
-        self.subword2id = {}
-        self.word2id = {}
-        self.word_freq = {}
-        self.subword_freq = {}
-        self.min_subword_freq = min_subword_freq
-        self.min_word_freq = min_word_freq
 
-    def _add_token(self, tok):
-        if tok not in self.token2id:
-            idx = len(self.token2id)
-            self.token2id[tok] = idx
-            self.id2token[idx] = tok
+        self.vocab = Counter()
+        self.bpe_merges = {}
 
     @property
     def pad_id(self):
         return self.token2id["<pad>"]
 
-    @property
-    def vocab_size_actual(self):
-        return len(self.token2id)
+    def observe(self, text):
+        for word in text.strip().split():
+            self.vocab[word] += 1
 
-    def build_char_vocab(self, corpus):
-        chars = set()
-        for line in corpus:
-            for ch in line:
-                if not ch.isspace():
-                    chars.add(ch)
-        for ch in sorted(chars):
-            tok = f"<ch:{ch}>"
-            self._add_token(tok)
-            self.char2id[ch] = self.token2id[tok]
+    def _get_stats(self, words):
+        pairs = Counter()
+        for w, freq in words.items():
+            symbols = list(w)
+            for i in range(len(symbols) - 1):
+                pairs[(symbols[i], symbols[i+1])] += freq
+        return pairs
 
-    def _count_pairs_chunk(self, chunk):
-        c = Counter()
-        for w in chunk:
-            for i in range(len(w) - 1):
-                c[(w[i], w[i+1])] += 1
-        return c
+    def train_bpe(self):
+        words = {w: f for w, f in self.vocab.items() if f >= self.min_freq}
 
-    def train_subwords(self, corpus, max_merges=5000, n_workers=4):
-        for ch in self.char2id:
-            self.subword2id[ch] = self.char2id[ch]
-
-        def split_word(w):
-            return list(w)
-
-        vocab = []
-        for line in corpus:
-            for w in line.strip().split():
-                vocab.append(split_word(w))
-
-        if not vocab:
-            return
-
-        for _ in range(max_merges):
-            if len(vocab) < n_workers:
-                chunks = [vocab]
-            else:
-                chunk_size = max(1, len(vocab) // n_workers)
-                chunks = [vocab[i:i+chunk_size] for i in range(0, len(vocab), chunk_size)]
-
-            with mp.Pool(n_workers) as pool:
-                counters = pool.map(self._count_pairs_chunk, chunks)
-
-            pair_counts = Counter()
-            for c in counters:
-                pair_counts.update(c)
-
-            if not pair_counts:
+        while len(self.token2id) < self.max_vocab:
+            stats = self._get_stats(words)
+            if not stats:
                 break
 
-            (a, b), freq = pair_counts.most_common(1)[0]
-            if freq < self.min_subword_freq:
+            (a, b), freq = stats.most_common(1)[0]
+            if freq < self.min_freq:
                 break
 
-            new_sw = a + b
-            if new_sw in self.subword2id:
-                continue
+            merge = a + b
+            self.bpe_merges[(a, b)] = merge
 
-            tok = f"<sw:{new_sw}>"
-            self._add_token(tok)
-            self.subword2id[new_sw] = self.token2id[tok]
-
-            new_vocab = []
-            for w in vocab:
+            new_words = {}
+            for w, f in words.items():
+                symbols = list(w)
                 i = 0
                 merged = []
-                while i < len(w):
-                    if i < len(w) - 1 and w[i] == a and w[i+1] == b:
-                        merged.append(new_sw)
+                while i < len(symbols):
+                    if i < len(symbols)-1 and (symbols[i], symbols[i+1]) in self.bpe_merges:
+                        merged.append(self.bpe_merges[(symbols[i], symbols[i+1])])
                         i += 2
                     else:
-                        merged.append(w[i])
+                        merged.append(symbols[i])
                         i += 1
-                new_vocab.append(merged)
-            vocab = new_vocab
+                new_words[" ".join(merged)] = f
+            words = new_words
 
-    def observe_sentence(self, sentence):
-        words = sentence.strip().split()
-        new_tokens = []
-        for w in words:
-            self.word_freq[w] = self.word_freq.get(w, 0) + 1
-            if self.word_freq[w] >= self.min_word_freq and w not in self.word2id:
-                tok = f"<w:{w}>"
-                self._add_token(tok)
-                self.word2id[w] = self.token2id[tok]
-                new_tokens.append(tok)
-        return new_tokens
-
-    def _encode_word(self, w):
-        if w in self.word2id:
-            return [self.word2id[w]]
-        ids = []
-        i = 0
-        L = len(w)
-        while i < L:
-            best = None
-            best_len = 0
-            for l in range(1, L - i + 1):
-                sw = w[i:i+l]
-                if sw in self.subword2id:
-                    best = self.subword2id[sw]
-                    best_len = l
-            if best is not None:
-                ids.append(best)
-                i += best_len
-            else:
-                ch = w[i]
-                if ch in self.char2id:
-                    ids.append(self.char2id[ch])
-                else:
-                    ids.append(self.token2id["<unk>"])
-                i += 1
-        return ids
+            tok = f"<bpe:{merge}>"
+            self.token2id[tok] = len(self.token2id)
+            self.id2token[len(self.id2token)] = tok
 
     def encode(self, text):
         ids = []
         for w in text.strip().split():
-            ids.extend(self._encode_word(w))
+            symbols = list(w)
+            merged = True
+            while merged:
+                merged = False
+                for (a, b), m in self.bpe_merges.items():
+                    i = 0
+                    new = []
+                    while i < len(symbols):
+                        if i < len(symbols)-1 and symbols[i] == a and symbols[i+1] == b:
+                            new.append(m)
+                            i += 2
+                            merged = True
+                        else:
+                            new.append(symbols[i])
+                            i += 1
+                    symbols = new
+            for s in symbols:
+                tok = f"<bpe:{s}>"
+                if tok not in self.token2id:
+                    tok = "<unk>"
+                ids.append(self.token2id[tok])
         return ids
 
     def decode(self, ids):
-        pieces = []
+        out = []
         for i in ids:
-            if i not in self.id2token:
-                continue
-            tok = self.id2token[i]
-            if tok in self.special_tokens:
-                continue
-            if tok.startswith("<w:"):
-                pieces.append(tok[3:-1])
-            elif tok.startswith("<sw:"):
-                pieces.append(tok[4:-1])
-            elif tok.startswith("<ch:"):
-                pieces.append(tok[4:-1])
-        return " ".join(pieces)
-
+            tok = self.id2token.get(i, "<unk>")
+            if tok.startswith("<bpe:"):
+                out.append(tok[5:-1])
+        return "".join(out)
 
 
 def build_online_samples(sentence, tok, window=16):
@@ -234,125 +165,53 @@ def compute_surprise(logits, target_id):
     confidence = p
     surprise = 1.0 - confidence
     return confidence, surprise
-
 class RelationalWorldModel(nn.Module):
-    def __init__(self, hidden_size, max_nodes=1024, max_edges=4096):
+    def __init__(self, dim=256, max_nodes=512, ttl=64):
         super().__init__()
-        self.hidden_size = hidden_size
+        self.dim = dim
         self.max_nodes = max_nodes
-        self.max_edges = max_edges
+        self.ttl = ttl
 
-        self.register_buffer("node_reprs", torch.empty(0, hidden_size))
-        self.node_ids = []
+        self.register_buffer("nodes", torch.zeros(0, dim))
+        self.node_ttl = []
 
-        self.register_buffer("edge_src",  torch.empty(0, dtype=torch.long))
-        self.register_buffer("edge_dst",  torch.empty(0, dtype=torch.long))
-        self.register_buffer("edge_rel",  torch.empty(0, hidden_size))
-        self.register_buffer("edge_conf", torch.empty(0, 1))
-
-        self.W_msg = nn.Linear(hidden_size * 2, hidden_size)
-        self.W_self = nn.Linear(hidden_size, hidden_size)
+        self.W_msg = nn.Linear(dim * 2, dim)
+        self.W_self = nn.Linear(dim, dim)
         self.act = nn.Tanh()
 
-    def _device(self):
-        return self.W_msg.weight.device
+    def _add_node(self, vec):
+        if self.nodes.size(0) >= self.max_nodes:
+            self.nodes = self.nodes[1:]
+            self.node_ttl = self.node_ttl[1:]
 
-    def _add_or_get_node(self, vec, node_id=None, sim_thresh=0.9):
-        with torch.no_grad():
-            v = vec.mean(dim=0, keepdim=True).detach().to(self._device())
-            if self.node_reprs.numel() == 0:
-                self.node_reprs = v
-                self.node_ids = [node_id]
-                return 0
+        self.nodes = torch.cat([self.nodes, vec], dim=0)
+        self.node_ttl.append(self.ttl)
 
-            v_norm = F.normalize(v, dim=-1)
-            nodes_norm = F.normalize(self.node_reprs, dim=-1)
-            sims = (v_norm @ nodes_norm.t()).squeeze(0)
-            best_i = int(sims.argmax().item())
-            if float(sims[best_i]) >= sim_thresh:
-                return best_i
+    def store(self, subj, rel, obj):
+        vec = (subj + rel + obj).mean(dim=0, keepdim=True)
+        self._add_node(vec)
 
-            self.node_reprs = torch.cat([self.node_reprs, v], dim=0)
-            self.node_ids.append(node_id)
+    def decay(self):
+        new_nodes = []
+        new_ttl = []
+        for node, t in zip(self.nodes, self.node_ttl):
+            if t > 1:
+                new_nodes.append(node.unsqueeze(0))
+                new_ttl.append(t - 1)
+        if new_nodes:
+            self.nodes = torch.cat(new_nodes, dim=0)
+            self.node_ttl = new_ttl
+        else:
+            self.nodes = torch.zeros(0, self.dim, device=self.nodes.device)
+            self.node_ttl = []
 
-            if self.node_reprs.size(0) > self.max_nodes:
-                excess = self.node_reprs.size(0) - self.max_nodes
-                self.node_reprs = self.node_reprs[excess:]
-                self.node_ids = self.node_ids[excess:]
-                self.edge_src  = self.edge_src.new_empty(0)
-                self.edge_dst  = self.edge_dst.new_empty(0)
-                self.edge_rel  = self.edge_rel.new_empty(0, self.hidden_size)
-                self.edge_conf = self.edge_conf.new_empty(0, 1)
+    def query(self, vec):
+        if self.nodes.size(0) == 0:
+            return torch.zeros_like(vec)
 
-            return self.node_reprs.size(0) - 1
-
-    def store(self, subj_vec, rel_vec, obj_vec, confidence=1.0):
-        with torch.no_grad():
-            device = self._device()
-            s_idx = self._add_or_get_node(subj_vec)
-            o_idx = self._add_or_get_node(obj_vec)
-
-            rel = rel_vec.mean(dim=0, keepdim=True).detach().to(device)
-            conf = torch.tensor([[float(confidence)]], device=device)
-
-            src = torch.tensor([s_idx], dtype=torch.long, device=device)
-            dst = torch.tensor([o_idx], dtype=torch.long, device=device)
-
-            if self.edge_src.numel() == 0:
-                self.edge_src  = src
-                self.edge_dst  = dst
-                self.edge_rel  = rel
-                self.edge_conf = conf
-            else:
-                self.edge_src  = torch.cat([self.edge_src,  src], dim=0)
-                self.edge_dst  = torch.cat([self.edge_dst,  dst], dim=0)
-                self.edge_rel  = torch.cat([self.edge_rel,  rel], dim=0)
-                self.edge_conf = torch.cat([self.edge_conf, conf], dim=0)
-
-            if self.edge_src.size(0) > self.max_edges:
-                excess = self.edge_src.size(0) - self.max_edges
-                self.edge_src  = self.edge_src[excess:]
-                self.edge_dst  = self.edge_dst[excess:]
-                self.edge_rel  = self.edge_rel[excess:]
-                self.edge_conf = self.edge_conf[excess:]
-
-    def _message_passing(self, node_states, steps=2):
-        if self.edge_src.numel() == 0:
-            return node_states
-
-        device = node_states.device
-        src  = self.edge_src.to(device)
-        dst  = self.edge_dst.to(device)
-        rel  = self.edge_rel.to(device)
-        conf = self.edge_conf.to(device)
-
-        for _ in range(steps):
-            src_h = node_states[src]
-            msg_in = torch.cat([src_h, rel], dim=-1)
-            msg = self.act(self.W_msg(msg_in)) * conf
-            agg_msgs = torch.zeros_like(node_states)
-            agg_msgs.index_add_(0, dst, msg)
-            node_states = self.act(self.W_self(node_states) + agg_msgs)
-
-        return node_states
-
-    def query(self, entity_vec, k=4):
-        if self.node_reprs.numel() == 0:
-            return torch.zeros_like(entity_vec.mean(dim=-2))
-
-        with torch.no_grad():
-            device = entity_vec.device
-            node_states = self.node_reprs.to(device)
-            node_states = self._message_passing(node_states, steps=2)
-
-            v = entity_vec.mean(dim=0, keepdim=True)
-            v_norm = F.normalize(v, dim=-1)
-            nodes_norm = F.normalize(node_states, dim=-1)
-            sims = (v_norm @ nodes_norm.t()).squeeze(0)
-            best_i = int(sims.argmax().item())
-            ctx = node_states[best_i:best_i+1]
-            B = entity_vec.size(0)
-            return ctx.expand(B, -1)
+        sims = F.cosine_similarity(vec, self.nodes)
+        idx = sims.argmax().item()
+        return self.nodes[idx:idx+1]
 
 
 class RelationalGate(nn.Module):
@@ -364,26 +223,26 @@ class RelationalGate(nn.Module):
         return torch.sigmoid(self.gate(concept_mix))
 
 class ConceptExtractor(nn.Module):
-    def __init__(self, hidden_size):
+    def __init__(self, dim):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.subj_proj = nn.Linear(hidden_size, hidden_size)
-        self.act_proj  = nn.Linear(hidden_size, hidden_size)
-        self.obj_proj  = nn.Linear(hidden_size, hidden_size)
-        self.subj_score = nn.Linear(hidden_size, 1)
-        self.act_score  = nn.Linear(hidden_size, 1)
-        self.obj_score  = nn.Linear(hidden_size, 1)
+        self.subj = nn.Linear(dim, dim)
+        self.act  = nn.Linear(dim, dim)
+        self.obj  = nn.Linear(dim, dim)
 
-    def forward(self, token_states):
-        B, T, H = token_states.shape
-        subj_w = torch.softmax(self.subj_score(token_states).squeeze(-1), dim=-1)
-        act_w  = torch.softmax(self.act_score(token_states).squeeze(-1), dim=-1)
-        obj_w  = torch.softmax(self.obj_score(token_states).squeeze(-1), dim=-1)
+        self.ws = nn.Linear(dim, 1)
+        self.wa = nn.Linear(dim, 1)
+        self.wo = nn.Linear(dim, 1)
 
-        subj_vec = torch.bmm(subj_w.unsqueeze(1), self.subj_proj(token_states)).squeeze(1)
-        act_vec  = torch.bmm(act_w.unsqueeze(1),  self.act_proj(token_states)).squeeze(1)
-        obj_vec  = torch.bmm(obj_w.unsqueeze(1),  self.obj_proj(token_states)).squeeze(1)
-        return subj_vec, act_vec, obj_vec
+    def forward(self, h):
+        w_s = torch.softmax(self.ws(h).squeeze(-1), dim=-1)
+        w_a = torch.softmax(self.wa(h).squeeze(-1), dim=-1)
+        w_o = torch.softmax(self.wo(h).squeeze(-1), dim=-1)
+
+        subj = torch.bmm(w_s.unsqueeze(1), self.subj(h)).squeeze(1)
+        act  = torch.bmm(w_a.unsqueeze(1), self.act(h)).squeeze(1)
+        obj  = torch.bmm(w_o.unsqueeze(1), self.obj(h)).squeeze(1)
+
+        return subj, act, obj
 
 class ConfidenceNet(nn.Module):
     def __init__(self, hidden_size, vocab_size):
@@ -402,47 +261,37 @@ class ConfidenceNet(nn.Module):
         return conf
 
 
-
 class WorkingMemory(nn.Module):
-    def __init__(self, num_slots=16, slot_dim=64):
+    def __init__(self, num_slots=12, slot_dim=256):
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
+
         self.init_content = nn.Parameter(torch.randn(num_slots, slot_dim) * 0.01)
+        self.addr_proj = nn.Linear(slot_dim, num_slots)
         self.write_proj = nn.Linear(slot_dim, slot_dim)
         self.write_gate = nn.Linear(slot_dim, 1)
-        self.addr_proj = nn.Linear(slot_dim, num_slots)
+        self.norm = RMSNorm(slot_dim)
 
-    def init_state(self, batch_size, device=None):
-        if device is None:
-            device = self.init_content.device
-        return self.init_content.unsqueeze(0).expand(batch_size, self.num_slots, self.slot_dim).to(device)
+    def init_state(self, batch_size, device):
+        return self.init_content.unsqueeze(0).expand(batch_size, -1, -1).to(device)
 
-    def forward(self, query, wm_state=None):
-        if wm_state is not None:
-            wm_state = wm_state.detach()
-
+    def forward(self, query, wm_state):
         B, D = query.shape
-        S = self.num_slots
-        device = query.device
         if wm_state is None:
-            wm_state = self.init_state(B, device=device)
+            wm_state = self.init_state(B, query.device)
 
-        attn_logits = torch.bmm(wm_state, query.unsqueeze(-1)).squeeze(-1)
-        attn = F.softmax(attn_logits, dim=-1)
-        read_vec = torch.bmm(attn.unsqueeze(1), wm_state).squeeze(1)
+        attn = torch.softmax(torch.bmm(wm_state, query.unsqueeze(-1)).squeeze(-1), dim=-1)
+        read = torch.bmm(attn.unsqueeze(1), wm_state).squeeze(1)
 
-        addr_logits = self.addr_proj(query)
-        addr = F.softmax(addr_logits, dim=-1)
+        addr = torch.softmax(self.addr_proj(query), dim=-1)
         gate = torch.sigmoid(self.write_gate(query))
-        write_content = torch.tanh(self.write_proj(query))
+        write = torch.tanh(self.write_proj(query))
 
-        addr_exp = addr.unsqueeze(-1)
-        write_vec = write_content.unsqueeze(1)
-        gate_exp = gate.unsqueeze(-1)
-        delta = addr_exp * write_vec * gate_exp
-        new_wm_state = wm_state + delta
-        return read_vec, new_wm_state
+        delta = addr.unsqueeze(-1) * write.unsqueeze(1) * gate.unsqueeze(-1)
+        new_state = self.norm(wm_state + delta)
+
+        return read, new_state
 
 class LiquidSelfAttention(nn.Module):
     def __init__(self, d_model, num_heads=2, eps=1e-6):
@@ -606,108 +455,52 @@ class SwiGLU(nn.Module):
         return self.w3(x)
 
 class LiquidLM(nn.Module):
-    def __init__(self, vocab_size, d_model=64, hidden_size=64, window=16, num_layers=4,
-                 use_checkpoint=True):
+    def __init__(self, vocab_size, dim=1024, layers=24):
         super().__init__()
-        assert d_model <= 768
-        self.window = window
-        self.d_model = d_model
-        self.hidden_size = hidden_size
-        self.vocab_size = vocab_size
-        self._wm_state = None
-        self.use_checkpoint = use_checkpoint
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.attn = LiquidSelfAttention(d_model, num_heads=2)
-        self.pre_norm = RMSNorm(d_model)
-        self.mamba_layers = nn.ModuleList([MambaBlock(d_model, d_state=128) for _ in range(num_layers)])
-        self.ln = RMSNorm(hidden_size)
-        self.dropout = nn.Dropout(0.1)
-        self.lm_head = nn.Linear(hidden_size, vocab_size)
-        self.wm = WorkingMemory(num_slots=16, slot_dim=hidden_size)
-        self.wm_proj = nn.Linear(hidden_size, hidden_size)
-        self.concepts = ConceptExtractor(hidden_size)
-        self.rel_world = RelationalWorldModel(hidden_size)
-        self.rel_gate = RelationalGate(hidden_size)
-        self.rel_proj = nn.Linear(hidden_size, hidden_size)
-        self.conf_net = ConfidenceNet(hidden_size, vocab_size)
-        self.adapter = SwiGLU(hidden_size, 4 * hidden_size)
-        self.swiglu = SwiGLU(hidden_size, 4 * hidden_size)
+        self.dim = dim
 
+        self.embed = nn.Embedding(vocab_size, dim)
+        self.attn = LiquidSelfAttention(dim, num_heads=8)
+        self.mamba = nn.ModuleList([MambaBlock(dim, d_state=256) for _ in range(layers)])
 
-        self.adapter.requires_grad_(False)
-        self.proj_to_hidden = nn.Linear(d_model, hidden_size)
+        self.norm = RMSNorm(dim)
+        self.ff = SwiGLU(dim, 4 * dim)
 
-    def grow_vocab(self, new_vocab_size, tok):
-        old_vocab = self.lm_head.weight.data.shape[0]
-        if new_vocab_size <= old_vocab:
-            return
-        device = self.embedding.weight.device
-        self.embedding = grow_embedding(self.embedding, new_vocab_size).to(device)
-        old_w = self.lm_head.weight.data
-        old_b = self.lm_head.bias.data
-        old_vocab, dim = old_w.shape
-        new_head = nn.Linear(dim, new_vocab_size).to(device)
-        new_head.weight.data[:old_vocab] = old_w.clone()
-        new_head.bias.data[:old_vocab] = old_b.clone()
-        nn.init.normal_(new_head.weight.data[old_vocab:], mean=0.0, std=0.02)
-        nn.init.zeros_(new_head.bias.data[old_vocab:])
-        self.lm_head = new_head
-        self.conf_net = ConfidenceNet(self.hidden_size, new_vocab_size).to(device)
-        self.vocab_size = new_vocab_size
-        tok.token2id = {tok.id2token[i]: i for i in range(len(tok.id2token))}
+        self.concepts = ConceptExtractor(dim)
+        self.rwm = RelationalWorldModel(dim=256)
+        self.rwm_proj = nn.Linear(dim, 256)
 
-    def _run_attn(self, x):
-        return self.attn(x)
-    def forward(self, input_ids):
-        B, T = input_ids.shape
-        x = self.embedding(input_ids)
-        if self.use_checkpoint:
-            x = cp.checkpoint(self._run_attn, x)
-        else:
-            x = self.attn(x)
-        x = self.pre_norm(x)
-        for layer in self.mamba_layers:
-            if self.use_checkpoint:
-                def layer_forward(x, layer=layer):
-                    return layer(x)
-                x = cp.checkpoint(layer_forward, x)
-            else:
-                x = layer(x)
-        h = self.proj_to_hidden(x)
-        h = self.ln(h)
-        h = self.swiglu(h)
-        h = self.dropout(h)
+        self.wm = WorkingMemory(num_slots=12, slot_dim=256)
+        self.wm_proj = nn.Linear(256, dim)
 
-        subj_vec, act_vec, obj_vec = self.concepts(h)
+        self.lm_head = nn.Linear(dim, vocab_size)
 
-        subj_single = subj_vec.mean(dim=0, keepdim=True)
-        act_single  = act_vec.mean(dim=0, keepdim=True)
-        obj_single  = obj_vec.mean(dim=0, keepdim=True)
-        rel_single  = self.rel_proj(act_single)
+    def forward(self, ids, wm_state=None):
+        x = self.embed(ids)
+        x = self.attn(x)
 
-        self.rel_world.store(
-            subj_single,
-            rel_single,
-            obj_single,
-            confidence=1.0
-        )
+        for layer in self.mamba:
+            x = layer(x)
 
-        rel_ctx = self.rel_world.query(subj_single)
+        x = self.norm(x)
+        x = self.ff(x)
 
-        concept_mix = subj_vec + act_vec + obj_vec
-        gate = self.rel_gate(concept_mix)
-        rel_enhanced = h + gate.unsqueeze(1) * rel_ctx.unsqueeze(1)
+        subj, act, obj = self.concepts(x)
+        rel = self.rwm_proj(act.unsqueeze(1))
 
-        wm_read, self._wm_state = self.wm(
-            query=concept_mix,
-            wm_state=None
-        )
-        wm_read = self.wm_proj(wm_read)
-        rel_enhanced = rel_enhanced + wm_read.unsqueeze(1)
+        self.rwm.store(subj.unsqueeze(1), rel, obj.unsqueeze(1))
+        self.rwm.decay()
 
-        logits = self.lm_head(rel_enhanced)
-        conf = self.conf_net(rel_enhanced[:, -1, :], logits[:, -1, :])
-        return logits
+        rctx = self.rwm.query(subj.unsqueeze(1))
+        rctx = rctx.expand_as(subj.unsqueeze(1))
+
+        mix = x + rctx
+
+        wm_read, wm_state = self.wm(subj, wm_state)
+        mix = mix + self.wm_proj(wm_read).unsqueeze(1)
+
+        logits = self.lm_head(mix)
+        return logits, wm_state
 
 
 class MirrorLM(nn.Module):
