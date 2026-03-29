@@ -658,7 +658,6 @@ class LiquidLM(nn.Module):
 
     def _run_attn(self, x):
         return self.attn(x)
-
     def forward(self, input_ids):
         B, T = input_ids.shape
         x = self.embedding(input_ids)
@@ -678,9 +677,37 @@ class LiquidLM(nn.Module):
         h = self.ln(h)
         h = self.swiglu(h)
         h = self.dropout(h)
-        logits = self.lm_head(h)
-        return logits
 
+        subj_vec, act_vec, obj_vec = self.concepts(h)
+
+        subj_single = subj_vec.mean(dim=0, keepdim=True)
+        act_single  = act_vec.mean(dim=0, keepdim=True)
+        obj_single  = obj_vec.mean(dim=0, keepdim=True)
+        rel_single  = self.rel_proj(act_single)
+
+        self.rel_world.store(
+            subj_single,
+            rel_single,
+            obj_single,
+            confidence=1.0
+        )
+
+        rel_ctx = self.rel_world.query(subj_single)
+
+        concept_mix = subj_vec + act_vec + obj_vec
+        gate = self.rel_gate(concept_mix)
+        rel_enhanced = h + gate.unsqueeze(1) * rel_ctx.unsqueeze(1)
+
+        wm_read, self._wm_state = self.wm(
+            query=concept_mix,
+            wm_state=self._wm_state
+        )
+        wm_read = self.wm_proj(wm_read)
+        rel_enhanced = rel_enhanced + wm_read.unsqueeze(1)
+
+        logits = self.lm_head(rel_enhanced)
+        conf = self.conf_net(rel_enhanced[:, -1, :], logits[:, -1, :])
+        return logits, conf, self._wm_state
 
 
 class MirrorLM(nn.Module):
