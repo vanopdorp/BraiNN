@@ -1,3 +1,4 @@
+from collections import Counter
 import re
 import random
 import math
@@ -12,7 +13,33 @@ from collections import Counter
 from torch.amp import autocast, GradScaler
 import os
 import requests
-import zipfile
+import sentencepiece as spm
+import cudf
+from torch.utils.checkpoint import checkpoint
+
+class SPTokenizer:
+    def __init__(self, model_path):
+        self.sp = spm.SentencePieceProcessor()
+        self.sp.load(model_path)
+
+        self.token2id = {self.sp.id_to_piece(i): i for i in range(self.sp.get_piece_size())}
+        self.id2token = {i: self.sp.id_to_piece(i) for i in range(self.sp.get_piece_size())}
+
+    @property
+    def pad_id(self):
+        return self.sp.pad_id() if self.sp.pad_id() >= 0 else 0
+
+    @property
+    def vocab_size_actual(self):
+        return self.sp.get_piece_size()
+
+    def encode(self, text):
+        return self.sp.encode(text, out_type=int)
+
+    def decode(self, ids):
+        return self.sp.decode(ids)
+
+
 
 def export_model_state(tok, real_model, hippocampus, filename="model_export.json"):
     export_data = {}
@@ -34,105 +61,26 @@ def export_model_state(tok, real_model, hippocampus, filename="model_export.json
 
     print(f"Model state exported to {filename}")
 
-class DynamicTokenizer:
-    def __init__(self, min_freq=2, max_vocab=50000):
-        self.min_freq = min_freq
-        self.max_vocab = max_vocab
 
-        self.special_tokens = ["<pad>", "<unk>"]
-        self.token2id = {t: i for i, t in enumerate(self.special_tokens)}
-        self.id2token = {i: t for t, i in self.token2id.items()}
+def apply_rope(x, seq_dim=1):
+    B, T, H, D = x.shape
+    half = D // 2
 
-        self.vocab = Counter()
-        self.bpe_merges = {}
+    freq = torch.arange(half, device=x.device, dtype=x.dtype)
+    freq = 1.0 / (10000 ** (freq / half))
 
-    @property
-    def pad_id(self):
-        return self.token2id["<pad>"]
-    @property
-    def vocab_size_actual(self):
-        return len(self.token2id)
+    pos = torch.arange(T, device=x.device, dtype=x.dtype)
+    angles = torch.einsum("t,d->td", pos, freq)
 
-    def observe(self, text):
-        for word in text.strip().split():
-            self.vocab[word] += 1
+    sin = angles.sin()[None, :, None, :]
+    cos = angles.cos()[None, :, None, :]
 
-    def _get_stats(self, words):
-        pairs = Counter()
-        for w, freq in words.items():
-            symbols = list(w)
-            for i in range(len(symbols) - 1):
-                pairs[(symbols[i], symbols[i+1])] += freq
-        return pairs
+    x1 = x[..., :half]
+    x2 = x[..., half:]
 
-    def train_bpe(self):
-        words = {w: f for w, f in self.vocab.items() if f >= self.min_freq}
-
-        while len(self.token2id) < self.max_vocab:
-            stats = self._get_stats(words)
-            if not stats:
-                break
-
-            (a, b), freq = stats.most_common(1)[0]
-            if freq < self.min_freq:
-                break
-
-            merge = a + b
-            self.bpe_merges[(a, b)] = merge
-
-            new_words = {}
-            for w, f in words.items():
-                symbols = list(w)
-                i = 0
-                merged = []
-                while i < len(symbols):
-                    if i < len(symbols)-1 and (symbols[i], symbols[i+1]) in self.bpe_merges:
-                        merged.append(self.bpe_merges[(symbols[i], symbols[i+1])])
-                        i += 2
-                    else:
-                        merged.append(symbols[i])
-                        i += 1
-                new_words[" ".join(merged)] = f
-            words = new_words
-
-            tok = f"<bpe:{merge}>"
-            self.token2id[tok] = len(self.token2id)
-            self.id2token[len(self.id2token)] = tok
-
-    def encode(self, text):
-        ids = []
-        for w in text.strip().split():
-            symbols = list(w)
-            merged = True
-            while merged:
-                merged = False
-                for (a, b), m in self.bpe_merges.items():
-                    i = 0
-                    new = []
-                    while i < len(symbols):
-                        if i < len(symbols)-1 and symbols[i] == a and symbols[i+1] == b:
-                            new.append(m)
-                            i += 2
-                            merged = True
-                        else:
-                            new.append(symbols[i])
-                            i += 1
-                    symbols = new
-            for s in symbols:
-                tok = f"<bpe:{s}>"
-                if tok not in self.token2id:
-                    tok = "<unk>"
-                ids.append(self.token2id[tok])
-        return ids
-
-    def decode(self, ids):
-        out = []
-        for i in ids:
-            tok = self.id2token.get(i, "<unk>")
-            if tok.startswith("<bpe:"):
-                out.append(tok[5:-1])
-        return "".join(out)
-
+    x_rot = torch.cat([x1 * cos - x2 * sin,
+                       x1 * sin + x2 * cos], dim=-1)
+    return x_rot
 
 def build_online_samples(sentence, tok, window=16):
     pad = tok.pad_id
@@ -174,50 +122,51 @@ class RelationalWorldModel(nn.Module):
         self.dim = dim
         self.max_nodes = max_nodes
         self.default_ttl = ttl
-
         self.register_buffer("nodes", torch.zeros(0, dim))
         self.node_ttl = []
-
         self.W_msg = nn.Linear(dim * 2, dim)
         self.W_self = nn.Linear(dim, dim)
         self.act = nn.Tanh()
+
     def query(self, vec, k=4):
         if self.nodes.size(0) == 0:
-            return torch.zeros(self.dim, device=self.nodes.device)
+            return torch.zeros(self.dim, device=vec.device)
         if vec.dim() == 3:
-            vec = vec.mean(dim=0)
+            vec = vec.mean(dim=1)
         if vec.dim() == 2:
-            vec = vec.squeeze(0)
+            vec = vec.mean(dim=0)
+        if vec.dim() == 1 and vec.shape[0] != self.dim:
+            return torch.zeros(self.dim, device=vec.device)
         scores = torch.matmul(self.nodes, vec.to(self.nodes.device))
         topk = torch.topk(scores, min(k, scores.size(0)), dim=0).indices
-        ctx = self.nodes[topk].mean(dim=0)
-        return ctx
-
+        return self.nodes[topk].mean(dim=0)
     def _add_node(self, vec):
-        if vec.dim() == 1:
-            vec = vec.unsqueeze(0)
-        elif vec.dim() == 3:
-            vec = vec.mean(dim=0)
+        with torch.no_grad():
+            if vec.dim() == 1:
+                vec = vec.unsqueeze(0)
+            elif vec.dim() == 3:
+                vec = vec.mean(dim=0)
 
-        if self.nodes.size(0) >= self.max_nodes:
-            self.nodes = self.nodes[1:]
-            self.node_ttl = self.node_ttl[1:]
+            vec = vec.detach()
 
-        self.nodes = torch.cat([self.nodes, vec.to(self.nodes.device)], dim=0)
-        self.node_ttl.append(self.default_ttl)
+            if self.nodes.size(0) >= self.max_nodes:
+                self.nodes = self.nodes[1:]
+                self.node_ttl = self.node_ttl[1:]
+
+            self.nodes = torch.cat([self.nodes, vec.to(self.nodes.device)], dim=0)
+            self.node_ttl.append(self.default_ttl)
 
     def store(self, subj, rel, obj):
-        vec = subj + rel + obj
-        vec = vec.mean(dim=0)
-        self._add_node(vec)
+        with torch.no_grad():
+            vec = subj + rel + obj
+            vec = vec.mean(dim=0).detach()
+            self._add_node(vec)
 
     def decay(self):
         if len(self.node_ttl) == 0:
             return
-
         self.node_ttl = [t - 1 for t in self.node_ttl]
         mask = torch.tensor([t > 0 for t in self.node_ttl], device=self.nodes.device)
-
         self.nodes = self.nodes[mask]
         self.node_ttl = [t for t in self.node_ttl if t > 0]
 
@@ -267,13 +216,11 @@ class ConfidenceNet(nn.Module):
         conf = torch.sigmoid(self.fc2(x))
         return conf
 
-
 class WorkingMemory(nn.Module):
     def __init__(self, num_slots=12, slot_dim=256):
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
-
         self.init_content = nn.Parameter(torch.randn(num_slots, slot_dim) * 0.01)
         self.addr_proj = nn.Linear(slot_dim, num_slots)
         self.write_proj = nn.Linear(slot_dim, slot_dim)
@@ -287,17 +234,13 @@ class WorkingMemory(nn.Module):
         B, D = query.shape
         if wm_state is None:
             wm_state = self.init_state(B, query.device)
-
         attn = torch.softmax(torch.bmm(wm_state, query.unsqueeze(-1)).squeeze(-1), dim=-1)
         read = torch.bmm(attn.unsqueeze(1), wm_state).squeeze(1)
-
         addr = torch.softmax(self.addr_proj(query), dim=-1)
         gate = torch.sigmoid(self.write_gate(query))
         write = torch.tanh(self.write_proj(query))
-
         delta = addr.unsqueeze(-1) * write.unsqueeze(1) * gate.unsqueeze(-1)
         new_state = self.norm(wm_state + delta)
-
         return read, new_state
 
 class LiquidSelfAttention(nn.Module):
@@ -322,6 +265,10 @@ class LiquidSelfAttention(nn.Module):
         B, T, D = x.shape
         q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim)
         k = self.k_proj(x).view(B, T, self.num_heads, self.head_dim)
+
+        q = apply_rope(q)
+        k = apply_rope(k)
+
         v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim)
 
         q = self.phi(q)
@@ -461,54 +408,93 @@ class SwiGLU(nn.Module):
         x = F.silu(a) * b
         return self.w3(x)
 
+class WorkingMemory(nn.Module):
+    def __init__(self, num_slots=12, slot_dim=256):
+        super().__init__()
+        self.num_slots = num_slots
+        self.slot_dim = slot_dim
+        self.init_content = nn.Parameter(torch.randn(num_slots, slot_dim) * 0.01)
+        self.addr_proj = nn.Linear(slot_dim, num_slots)
+        self.write_proj = nn.Linear(slot_dim, slot_dim)
+        self.write_gate = nn.Linear(slot_dim, 1)
+        self.norm = RMSNorm(slot_dim)
+
+    def init_state(self, batch_size, device):
+        return self.init_content.unsqueeze(0).expand(batch_size, -1, -1).to(device)
+
+    def forward(self, query, wm_state):
+        B, D = query.shape
+        if wm_state is None:
+            wm_state = self.init_state(B, query.device)
+        attn = torch.softmax(torch.bmm(wm_state, query.unsqueeze(-1)).squeeze(-1), dim=-1)
+        read = torch.bmm(attn.unsqueeze(1), wm_state).squeeze(1)
+        addr = torch.softmax(self.addr_proj(query), dim=-1)
+        gate = torch.sigmoid(self.write_gate(query))
+        write = torch.tanh(self.write_proj(query))
+        delta = addr.unsqueeze(-1) * write.unsqueeze(1) * gate.unsqueeze(-1)
+        new_state = self.norm(wm_state + delta)
+        return read, new_state
 class LiquidLM(nn.Module):
-    def __init__(self, vocab_size, dim=1024, layers=24):
+    def __init__(self, vocab_size, dim=768, layers=12, rwm_dim=128):
         super().__init__()
         self.dim = dim
+        self.rwm_dim = rwm_dim
 
         self.embed = nn.Embedding(vocab_size, dim)
         self.attn = LiquidSelfAttention(dim, num_heads=8)
-        self.mamba = nn.ModuleList([MambaBlock(dim, d_state=256) for _ in range(layers)])
+        self.mamba = nn.ModuleList([MambaBlock(dim, d_state=64) for _ in range(layers)])
 
         self.norm = RMSNorm(dim)
         self.ff = SwiGLU(dim, 4 * dim)
 
         self.concepts = ConceptExtractor(dim)
-        self.rwm = RelationalWorldModel(dim=256)
-        self.rwm_proj = nn.Linear(dim, 256)
+        self.subj_proj = nn.Linear(dim, rwm_dim)
+        self.obj_proj = nn.Linear(dim, rwm_dim)
+        self.rwm = RelationalWorldModel(dim=rwm_dim)
+        self.rwm_proj = nn.Linear(dim, rwm_dim)
 
-        self.wm = WorkingMemory(num_slots=12, slot_dim=256)
-        self.wm_proj = nn.Linear(256, dim)
+        self.wm = WorkingMemory(num_slots=8, slot_dim=rwm_dim)
+        self.wm_back = nn.Linear(rwm_dim, dim)
+        self.final_norm = RMSNorm(dim)
 
-        self.lm_head = nn.Linear(dim, vocab_size)
+        self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+        nn.init.normal_(self.lm_head.weight, std=0.02)
+
 
     def forward(self, ids, wm_state=None):
-        x = self.embed(ids)
-        x = self.attn(x)
-
+        x = self.embed(ids)          
+        x = checkpoint(self.attn, x)
         for layer in self.mamba:
-            x = layer(x)
+            x = checkpoint(layer, x)
 
         x = self.norm(x)
         x = self.ff(x)
 
         subj, act, obj = self.concepts(x)
-        rel = self.rwm_proj(act.unsqueeze(1))
+        subj_r = self.subj_proj(subj)    
+        obj_r  = self.obj_proj(obj)      
+        rel    = self.rwm_proj(act)      
 
-        self.rwm.store(subj.unsqueeze(1), rel, obj.unsqueeze(1))
+        self.rwm.store(subj_r, rel, obj_r)
         self.rwm.decay()
 
-        rctx = self.rwm.query(subj.unsqueeze(1))
-        rctx = rctx.expand_as(subj.unsqueeze(1))
+        query_vec = subj_r
+        rctx = self.rwm.query(query_vec)     
+        
+        if rctx.dim() == 1:
+            rctx = rctx.unsqueeze(0).expand_as(subj_r)
+        else:
+            rctx = rctx.expand_as(subj_r)
 
-        mix = x + rctx
+        mix_r = subj_r + rctx               
 
-        wm_read, wm_state = self.wm(subj, wm_state)
-        mix = mix + self.wm_proj(wm_read).unsqueeze(1)
-
+        wm_read, wm_state = self.wm(mix_r, wm_state)  
+        
+        mix = x + self.wm_back(wm_read).unsqueeze(1)  
+        mix = self.final_norm(mix)
         logits = self.lm_head(mix)
+            
         return logits
-
 
 class MirrorLM(nn.Module):
     def __init__(self, vocab_size, d_model=64, hidden_size=64, window=16):
@@ -715,7 +701,6 @@ def learn_new_sentence(real_model, mirror_model, hippocampus,
         probs = torch.softmax(logits_new, dim=-1)
         surpr = 1.0 - probs.gather(1, Y_new.unsqueeze(1)).mean().item()
         hippocampus.store(sentence, float(surpr ** 2))
-
 def compute_accuracy(model, X, Y, device):
     model.eval()
 
@@ -744,7 +729,6 @@ def compute_accuracy(model, X, Y, device):
     return acc
 
 
-
 def load_dailydialog_instruct():
     path = "/kaggle/working/dailydialog/data/dialogues.json"
 
@@ -769,13 +753,12 @@ def load_dailydialog_instruct():
     return instruct_samples
 
 
-
 def download_dailydialog_turns():
     url = "https://huggingface.co/datasets/ConvLab/dailydialog/resolve/main/data.zip?download=true"
     zip_path = "dailydialog.zip"
     extract_dir = "dailydialog"
 
-    # Download ZIP
+    
     if not os.path.exists(zip_path):
         print("Downloading DailyDialog ZIP…")
         r = requests.get(url)
@@ -783,7 +766,7 @@ def download_dailydialog_turns():
         with open(zip_path, "wb") as f:
             f.write(r.content)
 
-    # Extract ZIP
+    
     if not os.path.exists(extract_dir):
         print("Extracting DailyDialog ZIP…")
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
@@ -791,8 +774,163 @@ def download_dailydialog_turns():
 
 
 SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and politely."
+
+
 def count_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def stream_wikipedia(path):
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                yield line
+
+
+def stream_batches(path, tok, batch_size=16):
+    batch = []
+    for line in stream_wikipedia(path):
+        ids = torch.tensor(tok.encode(line), dtype=torch.long)
+        batch.append(ids)
+        if len(batch) == batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def prepare_batch(batch, device, vocab_size, pad_id=0):
+    lens = [len(seq) for seq in batch]
+    m = max(lens)
+
+    x = torch.full((len(batch), m), fill_value=pad_id, dtype=torch.long)
+    y = torch.full((len(batch), m), fill_value=pad_id, dtype=torch.long)
+
+    for i, seq in enumerate(batch):
+        
+        seq = seq.clone()
+        
+        seq = torch.clamp(seq, min=0, max=vocab_size - 1)
+        L = len(seq)
+
+        x[i, :L] = seq
+
+        if L == 1:
+            
+            y[i, 0] = seq[0]
+        else:
+            
+            y_seq = seq.clone()
+            y_seq[:-1] = seq[1:]
+            y_seq[-1] = seq[-1]
+            y[i, :L] = y_seq
+
+    return x.to(device), y.to(device)
+
+
+def eval_stream_loss(model, tok, path, device,
+                     batch_size=64, max_batches=50, pad_id=0):
+    model.eval()
+    total_loss = 0.0
+    count = 0
+    vocab_size = model.lm_head.weight.size(0)
+
+    with torch.no_grad():
+        for batch in stream_batches(path, tok, batch_size):
+            x, y = prepare_batch(batch, device, vocab_size, pad_id=pad_id)
+            logits = model(x)  
+            loss = F.cross_entropy(
+                logits.view(-1, vocab_size),
+                y.view(-1),
+                ignore_index=pad_id,
+            )
+            total_loss += loss.item()
+            count += 1
+            if count >= max_batches:
+                break
+
+    if count == 0:
+        return 0.0
+    return total_loss / count
+
+def train_step(real_model, mirror_model, hippocampus, tok,
+               batch, device, opt, scaler, pad_id=0):
+    vocab_size = real_model.lm_head.weight.size(0)
+    x, y = prepare_batch(batch, device, vocab_size, pad_id=pad_id)
+
+    
+    with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+        logits_real = real_model(x)  
+        loss_real = F.cross_entropy(
+            logits_real.view(-1, vocab_size),
+            y.view(-1),
+            ignore_index=pad_id,
+            label_smoothing=0.1,
+        )
+
+
+    opt.zero_grad(set_to_none=True)
+    scaler.scale(loss_real).backward()
+    scaler.unscale_(opt)
+    torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0)
+
+    scaler.step(opt)
+    scaler.update()
+
+    
+    with torch.no_grad():
+        with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+            logits_mirror, h_mirror, pred_error = mirror_model(x)  
+            probs = torch.softmax(logits_mirror, dim=-1)           
+
+            
+            y_last = y[:, -1]                                      
+            y_last = torch.clamp(y_last, 0, vocab_size - 1)
+
+            idx = torch.arange(y_last.size(0), device=device)
+            conf = probs[idx, y_last].mean().item()
+            surprise = 1.0 - conf
+
+    
+    sent_ids = batch[0].tolist()
+    sentence = tok.decode(sent_ids)
+    hippocampus.store(sentence, float(surprise * surprise))
+
+    return float(loss_real.item()), float(pred_error), float(surprise)
+
+def count_chunk(chunk):
+    return Counter(chunk.split())
+
+
+
+def observe_stream(tok, path, lines_per_chunk=100_000):
+    total = Counter()
+    buf = []
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                buf.append(line)
+
+            if len(buf) >= lines_per_chunk:
+                df = cudf.DataFrame({"text": buf})
+                tokens = df["text"].str.split()
+                flat = tokens.explode()
+                counts = flat.value_counts()
+                total.update(dict(counts.to_pandas()))
+                buf = []
+
+    if buf:
+        df = cudf.DataFrame({"text": buf})
+        tokens = df["text"].str.split()
+        flat = tokens.explode()
+        counts = flat.value_counts()
+        total.update(dict(counts.to_pandas()))
+
+    tok.vocab = total
+
 
 def main():
     if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
@@ -805,118 +943,62 @@ def main():
         device_real = torch.device("cpu")
         device_mirror = torch.device("cpu")
 
-    download_dailydialog_turns()
-    raw = load_dailydialog_instruct()
+    tok = SPTokenizer("/kaggle/input/models/joepvanopdorp/tokenizer/jax/default/1/tokenizer.model")
 
-    def fmt(s):
-        return (
-            "<|system|>\nYou are a helpful assistant.\n"
-            "<|user|>\n" + s["user"] + "\n"
-            "<|assistant|>\n" + s["assistant"] + "\n"
-        )
-
-    dialogs = [fmt(x) for x in raw]
-
-    tok = DynamicTokenizer()
-    for s in dialogs:
-        tok.observe(s)
     vocab_size = tok.vocab_size_actual
 
-    size = 256
+    size = 1024
     context = 128
-    lr = 2e-4
-    batch_size = 16
+    lr = 1e-4
+    batch_size = 8
     max_epochs = 3
 
     real_model = LiquidLM(vocab_size, size, context).to(device_real)
     mirror_model = MirrorLM(vocab_size, size, size, context).to(device_mirror)
     hippocampus = Hippocampus(max_episodes=size).to(device_real)
 
-    opt = optim.AdamW(real_model.parameters(), lr=lr)
+    opt = optim.AdamW(real_model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.1)
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=2000)
+    scaler = torch.amp.GradScaler("cuda" if device_real.type == "cuda" else "cpu")
 
-    encoded = [torch.tensor(tok.encode(s), dtype=torch.long) for s in dialogs]
+
     print("parameters:", count_params(real_model))
-
-    split = int(0.9 * len(encoded))
-    train_data = encoded[:split]
-    test_data = encoded[split:]
-
-    def make_batches(data, bs):
-        random.shuffle(data)
-        batch = []
-        for x in data:
-            batch.append(x)
-            if len(batch) == bs:
-                yield batch
-                batch = []
-        if batch:
-            yield batch
-
-    def eval_loss(model, data, device, batch_size=64):
-        model.eval()
-        total_loss = 0
-        count = 0
-        with torch.no_grad():
-            for batch in make_batches(data, batch_size):
-                lens = [len(x) for x in batch]
-                m = max(lens)
-                x = torch.zeros(len(batch), m, dtype=torch.long)
-                y = torch.zeros(len(batch), m, dtype=torch.long)
-                for i, seq in enumerate(batch):
-                    x[i, :len(seq)] = seq
-                    y[i, :len(seq)-1] = seq[1:]
-                    y[i, len(seq)-1] = seq[-1]
-                x = x.to(device)
-                y = y.to(device)
-                logits = model(x)
-                logits = logits.reshape(-1, logits.size(-1))
-                y = y.reshape(-1)
-                loss = F.cross_entropy(logits, y)
-                total_loss += loss.item()
-                count += 1
-        return total_loss / count
 
     for epoch in range(max_epochs):
         real_model.train()
-        for batch_i, batch in enumerate(make_batches(train_data, batch_size)):
-            lens = [len(x) for x in batch]
-            m = max(lens)
-            x = torch.zeros(len(batch), m, dtype=torch.long)
-            y = torch.zeros(len(batch), m, dtype=torch.long)
-            for i, seq in enumerate(batch):
-                x[i, :len(seq)] = seq
-                y[i, :len(seq)-1] = seq[1:]
-                y[i, len(seq)-1] = seq[-1]
-            x = x.to(device_real)
-            y = y.to(device_real)
-            logits = real_model(x)
-            logits = logits.reshape(-1, logits.size(-1))
-            y = y.reshape(-1)
-            loss = F.cross_entropy(logits, y)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-
+        mirror_model.train()
+        for batch_i, batch in enumerate(stream_batches("/kaggle/input/datasets/joepvanopdorp/wikipedia-en-download/train.txt", tok, batch_size)):
+            loss_r, pe, surpr = train_step(real_model, mirror_model, hippocampus, tok, batch, device_real, opt,scaler)
             if batch_i % 10 == 0:
-                print(f"epoch {epoch+1}/{max_epochs} | batch {batch_i} | train_loss={loss.item():.4f}")
-            if batch_i % 100 == 0:
-                test_loss = eval_loss(real_model, test_data, device_real, batch_size)
-                print("test loss:",test_loss)
+                print(f"epoch {epoch+1}/{max_epochs} | batch {batch_i} | train_loss={loss_r:.4f} | pred_err={pe:.4f} | surpr={surpr:.4f}")
+            if batch_i % 2000 == 0 and batch_i > 0:
+                break
         scheduler.step()
-        test_loss = eval_loss(real_model, test_data, device_real, batch_size)
+        test_loss = eval_stream_loss(real_model, tok, "/kaggle/input/datasets/joepvanopdorp/wikipedia-en-download/train.txt", device_real, batch_size=64, max_batches=50)
         print(f"epoch {epoch+1} | test_loss={test_loss:.4f}")
 
-    def generate(model, tok, prompt, device, max_new=40, seq_len=128):
+    def generate(model, tok, prompt, device, max_new=80, seq_len=128, temperature=0.8, top_k=40):
         model.eval()
         ids = tok.encode(prompt)[-seq_len:]
+        wm_state = None
+
         for _ in range(max_new):
             x = torch.tensor([ids], dtype=torch.long, device=device)
             with torch.no_grad():
-                logits = model(x)
-            nid = int(logits[0, -1].argmax().item())
-            ids.append(nid)
+                logits = model(x, wm_state)
+                logits = logits[:, -1, :] / temperature
+
+            vals, idxs = torch.topk(logits, top_k)
+            probs = torch.softmax(vals, dim=-1)
+            next_id = idxs[0, torch.multinomial(probs, 1).item()].item()
+
+            ids.append(next_id)
             ids = ids[-seq_len:]
+
+            if tok.id2token[next_id] == "<|assistant|>":
+                break
+
         return tok.decode(ids)
 
     out = generate(real_model, tok, "<|user|>\nHello\n<|assistant|>\n", device_real)
@@ -925,7 +1007,6 @@ def main():
     export_model_state(tok, real_model, hippocampus, filename="model_export.json")
     torch.save({"model": real_model.state_dict(), "tokenizer": tok}, "model.pth")
 
+
 if __name__ == "__main__":
     main()
-
- 
