@@ -16,50 +16,35 @@ import requests
 import sentencepiece as spm
 import cudf
 from torch.utils.checkpoint import checkpoint
-
+from concurrent.futures import ThreadPoolExecutor
+import sentencepiece as spm
+import torch
+from time import perf_counter
 class SPTokenizer:
     def __init__(self, model_path):
         self.sp = spm.SentencePieceProcessor()
         self.sp.load(model_path)
 
-        self.token2id = {self.sp.id_to_piece(i): i for i in range(self.sp.get_piece_size())}
-        self.id2token = {i: self.sp.id_to_piece(i) for i in range(self.sp.get_piece_size())}
+        
+        self.vocab_size_actual = self.sp.get_piece_size()
+        self.pad_id = self.sp.pad_id() if self.sp.pad_id() >= 0 else 0
 
-    @property
-    def pad_id(self):
-        return self.sp.pad_id() if self.sp.pad_id() >= 0 else 0
-
-    @property
-    def vocab_size_actual(self):
-        return self.sp.get_piece_size()
-
+    
     def encode(self, text):
+        
         return self.sp.encode(text, out_type=int)
 
+    
+    def encode_batch(self, texts):
+        
+        return self.sp.encode(texts, out_type=int)
+
+    
     def decode(self, ids):
         return self.sp.decode(ids)
 
-
-
-def export_model_state(tok, real_model, hippocampus, filename="model_export.json"):
-    export_data = {}
-
-    vocab_list = [tok.id2token[i] for i in range(len(tok.id2token))]
-    export_data["vocabulary"] = vocab_list
-
-
-    wm = real_model.wm.init_content.detach().cpu().tolist()
-    export_data["working_memory"] = wm
-
-    export_data["hippocampus"] = [
-        {"sentence": s, "priority": p}
-        for (s, p) in hippocampus.episodes
-    ]
-
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(export_data, f, indent=2, ensure_ascii=False)
-
-    print(f"Model state exported to {filename}")
+    def decode_batch(self, batch_ids):
+        return self.sp.decode(batch_ids)
 
 
 def apply_rope(x, seq_dim=1):
@@ -260,31 +245,21 @@ class LiquidSelfAttention(nn.Module):
 
     def phi(self, x):
         return F.elu(x) + 1.0
-
     def forward(self, x):
         B, T, D = x.shape
-        q = self.q_proj(x).view(B, T, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(B, T, self.num_heads, self.head_dim)
+        q = self.phi(self.q_proj(x).view(B, T, self.num_heads, self.head_dim))
+        k = self.phi(self.k_proj(x).view(B, T, self.num_heads, self.head_dim))
+        v =          self.v_proj(x).view(B, T, self.num_heads, self.head_dim)
 
         q = apply_rope(q)
         k = apply_rope(k)
 
-        v = self.v_proj(x).view(B, T, self.num_heads, self.head_dim)
+        
+        kv  = torch.einsum("bthd,bthe->bhde", k, v)   
+        out = torch.einsum("bthd,bhde->bthe", q, kv)   
+        z   = torch.einsum("bthd,bhd->bth",  q, k.sum(dim=1)).clamp(min=self.eps)
 
-        q = self.phi(q)
-        k = self.phi(k)
-
-        k_sum = k.sum(dim=1)
-        kv_sum = torch.einsum("bthd,bthd->bhd", k, v)
-        kv_sum = kv_sum.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
-
-        out = torch.einsum("bthd,bhdv->bthv", q, kv_sum)
-        z = torch.einsum("bthd,bhd->bth", q, k_sum)
-        z = (z + self.eps).unsqueeze(-1)
-
-        out = out / z
-        out = out.reshape(B, T, D)
-
+        out = (out / z.unsqueeze(-1)).reshape(B, T, D)
         gate = torch.sigmoid(self.gate_proj(x))
         return gate * out + (1.0 - gate) * x
 
@@ -328,24 +303,27 @@ class S4DSSM(nn.Module):
 
     def forward(self, x):
         B, T, D = x.shape
-        device = x.device
-        dtype = x.dtype
+        
+        dt      = torch.exp(self.log_dt)
+        lambda_ = -torch.exp(self.log_lambda)          
+        log_decay = lambda_ * dt                        
 
-        dt = torch.exp(self.log_dt)
-        lambda_ = -torch.exp(self.log_lambda)      
-        decay = torch.exp(lambda_ * dt)              
+        t_idx = torch.arange(T, device=x.device, dtype=x.dtype)  
 
-        h = torch.zeros(B, self.d_state, device=device, dtype=dtype)
-        outputs = []
+        
+        log_decay_t = t_idx.unsqueeze(1) * log_decay.unsqueeze(0)  
+        log_decay_t = log_decay_t.clamp(min=-30.0, max=0.0)        
 
-        for t in range(T):
-            u = x[:, t, :]                        
-            Bu = u @ self.B.T                      
-            h = h * decay.unsqueeze(0) + Bu         
-            y = h @ self.C.T                         
-            outputs.append(y.unsqueeze(1))
+        decay_t     = log_decay_t.exp()                  
+        inv_decay_t = (-log_decay_t).exp().clamp(max=1e6) 
 
-        return torch.cat(outputs, dim=1)    
+        Bu = x @ self.B.T                                
+
+        Bu_scaled = Bu * inv_decay_t.unsqueeze(0)        
+        h_scaled  = Bu_scaled.cumsum(dim=1)
+        h_out     = h_scaled * decay_t.unsqueeze(0)
+
+        return h_out @ self.C.T                          
 
 class MambaBlock(nn.Module):
     def __init__(self, d_model, d_state=128):
@@ -505,73 +483,23 @@ class MirrorLM(nn.Module):
 
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.attn = LiquidSelfAttention(d_model, num_heads=2)
-        self.liquid = LiquidGRUCell(d_model, hidden_size)
+        self.gru = nn.GRU(d_model, hidden_size, batch_first=True)  
         self.ln = RMSNorm(hidden_size)
         self.dropout = nn.Dropout(0.1)
         self.lm_head = nn.Linear(hidden_size, vocab_size)
-
-        self.register_buffer("fast_W", torch.zeros(hidden_size, hidden_size))
-        self.meta_rnn = nn.GRUCell(2, 16)
-        self.meta_out_lr = nn.Linear(16, 1)
-        self.meta_out_fw = nn.Linear(16, 1)
-        self.meta_state = None
         self.vocab_size = vocab_size
 
-    def grow_vocab(self, new_vocab_size):
-        old_emb = self.embedding.weight.data
-        old_vocab, dim = old_emb.shape
-        if new_vocab_size <= old_vocab:
-            return
-        device = old_emb.device
-        new_emb = nn.Embedding(new_vocab_size, dim).to(device)
-        new_emb.weight.data[:old_vocab] = old_emb.clone()
-        nn.init.normal_(new_emb.weight.data[old_vocab:], mean=0.0, std=0.02)
-        self.embedding = new_emb
-
-        old_w = self.lm_head.weight.data
-        old_b = self.lm_head.bias.data
-        new_head = nn.Linear(self.hidden_size, new_vocab_size).to(device)
-        new_head.weight.data[:old_vocab] = old_w.clone()
-        new_head.bias.data[:old_vocab] = old_b.clone()
-        nn.init.normal_(new_head.weight.data[old_vocab:], mean=0.0, std=0.02)
-        nn.init.zeros_(new_head.bias.data[old_vocab:])
-        self.lm_head = new_head
-
     def forward(self, input_ids):
-        B, T = input_ids.shape
         x = self.embedding(input_ids)
         x = self.attn(x)
-
-        h = torch.zeros(B, self.hidden_size, device=input_ids.device)
-        prev_h = None
-        last_pred_error = torch.zeros(B, self.hidden_size, device=input_ids.device)
-
-        for t in range(T):
-            slow_h = self.liquid(x[:, t, :], h)
-            fast_term = h @ self.fast_W
-            h_next = slow_h + fast_term
-            if prev_h is not None:
-                pred_error = h_next - prev_h
-                last_pred_error = pred_error
-            prev_h = h_next
-            h = h_next
-
+        out, h_n = self.gru(x)               
+        h = h_n.squeeze(0)
+        pred_error = out[:, -1, :] - out[:, -2, :] if out.size(1) > 1 else torch.zeros_like(h)
         h = self.ln(h)
         h = self.dropout(h)
         logits = self.lm_head(h)
-        pred_error_norm = last_pred_error.pow(2).mean().sqrt().item()
+        pred_error_norm = pred_error.pow(2).mean().sqrt().item()
         return logits, h, pred_error_norm
-
-    def meta_step(self, loss_val, surprise, device="cpu"):
-        x = torch.tensor([[loss_val, surprise]], dtype=torch.float32, device=device)
-        if self.meta_state is None:
-            self.meta_state = torch.zeros(1, 16, device=device)
-        self.meta_state = self.meta_rnn(x, self.meta_state)
-        lr = torch.sigmoid(self.meta_out_lr(self.meta_state)).item() * 0.001
-        fw_scale = torch.sigmoid(self.meta_out_fw(self.meta_state)).item() * 0.1
-
-        return lr, fw_scale
-
 class Hippocampus(nn.Module):
     def __init__(self, max_episodes=512):
         super().__init__()
@@ -788,15 +716,47 @@ def stream_wikipedia(path):
                 yield line
 
 
-def stream_batches(path, tok, batch_size=16):
-    batch = []
+
+def stream_batches(path, tok, batch_size=16, max_workers=4, prefetch=32):
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    futures = []
+
+    def submit(line):
+        return executor.submit(tok.encode, line)
+
+    
     for line in stream_wikipedia(path):
-        ids = torch.tensor(tok.encode(line), dtype=torch.long)
-        batch.append(ids)
-        if len(batch) == batch_size:
-            yield batch
-            batch = []
-    if batch:
+        futures.append(submit(line))
+        if len(futures) >= prefetch:
+            break
+
+    while True:
+        batch_ids = []
+
+        
+        for _ in range(batch_size):
+            if not futures:
+                break
+            future = futures.pop(0)
+            ids = future.result()
+            batch_ids.append(ids)
+
+        if not batch_ids:
+            break
+
+        
+        for line in stream_wikipedia(path):
+            futures.append(submit(line))
+            if len(futures) >= prefetch:
+                break
+
+        
+        max_len = max(len(x) for x in batch_ids)
+        batch = torch.full((len(batch_ids), max_len), tok.pad_id, dtype=torch.long)
+
+        for i, seq in enumerate(batch_ids):
+            batch[i, :len(seq)] = torch.tensor(seq, dtype=torch.long)
+
         yield batch
 
 
@@ -855,13 +815,16 @@ def eval_stream_loss(model, tok, path, device,
     return total_loss / count
 
 def train_step(real_model, mirror_model, hippocampus, tok,
-               batch, device, opt, scaler, pad_id=0):
+               batch, device, opt, scaler, opt_mirror, pad_id=0):
+
     vocab_size = real_model.lm_head.weight.size(0)
     x, y = prepare_batch(batch, device, vocab_size, pad_id=pad_id)
 
     
+    
+    
     with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-        logits_real = real_model(x)  
+        logits_real = real_model(x)
         loss_real = F.cross_entropy(
             logits_real.view(-1, vocab_size),
             y.view(-1),
@@ -869,28 +832,37 @@ def train_step(real_model, mirror_model, hippocampus, tok,
             label_smoothing=0.1,
         )
 
-
     opt.zero_grad(set_to_none=True)
     scaler.scale(loss_real).backward()
     scaler.unscale_(opt)
     torch.nn.utils.clip_grad_norm_(real_model.parameters(), 1.0)
-
     scaler.step(opt)
     scaler.update()
 
     
+    
+    
+    
+    logits_mirror, h_mirror, pred_error = mirror_model(x)
+
+    
+    y_last = y[:, -1]
+    y_last = torch.clamp(y_last, 0, vocab_size - 1)
+
+    loss_mirror = F.cross_entropy(logits_mirror, y_last)
+
+    opt_mirror.zero_grad()
+    loss_mirror.backward()
+    opt_mirror.step()
+
+    
+    
+    
     with torch.no_grad():
-        with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-            logits_mirror, h_mirror, pred_error = mirror_model(x)  
-            probs = torch.softmax(logits_mirror, dim=-1)           
-
-            
-            y_last = y[:, -1]                                      
-            y_last = torch.clamp(y_last, 0, vocab_size - 1)
-
-            idx = torch.arange(y_last.size(0), device=device)
-            conf = probs[idx, y_last].mean().item()
-            surprise = 1.0 - conf
+        probs = torch.softmax(logits_mirror, dim=-1)
+        idx = torch.arange(y_last.size(0), device=device)
+        conf = probs[idx, y_last].mean().item()
+        surprise = 1.0 - conf
 
     
     sent_ids = batch[0].tolist()
@@ -949,63 +921,42 @@ def main():
 
     size = 1024
     context = 128
-    lr = 1e-4
-    batch_size = 8
+    lr = 3e-5
+    batch_size = 16
     max_epochs = 3
 
     real_model = LiquidLM(vocab_size, size, context).to(device_real)
     mirror_model = MirrorLM(vocab_size, size, size, context).to(device_mirror)
+
     hippocampus = Hippocampus(max_episodes=size).to(device_real)
 
     opt = optim.AdamW(real_model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.1)
-
+    opt_mirror = optim.AdamW(mirror_model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.1)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=2000)
     scaler = torch.amp.GradScaler("cuda" if device_real.type == "cuda" else "cpu")
 
 
     print("parameters:", count_params(real_model))
-
+    stop=True
+    last = perf_counter()
     for epoch in range(max_epochs):
         real_model.train()
         mirror_model.train()
         for batch_i, batch in enumerate(stream_batches("/kaggle/input/datasets/joepvanopdorp/wikipedia-en-download/train.txt", tok, batch_size)):
-            loss_r, pe, surpr = train_step(real_model, mirror_model, hippocampus, tok, batch, device_real, opt,scaler)
+            loss_r, pe, surpr = train_step(real_model, mirror_model, hippocampus, tok, batch, device_real, opt,scaler,opt_mirror)
             if batch_i % 10 == 0:
-                print(f"epoch {epoch+1}/{max_epochs} | batch {batch_i} | train_loss={loss_r:.4f} | pred_err={pe:.4f} | surpr={surpr:.4f}")
-            if batch_i % 2000 == 0 and batch_i > 0:
+                print(f"epoch {epoch+1}/{max_epochs} | batch {batch_i} | train_loss={loss_r:.4f} | pred_err={pe:.4f} | surpr={surpr:.4f} | time {perf_counter()-last:.4f}")
+                last = perf_counter()
+            if batch_i >= 20_000:
+                stop = True
                 break
+        if stop == True:
+            break
         scheduler.step()
         test_loss = eval_stream_loss(real_model, tok, "/kaggle/input/datasets/joepvanopdorp/wikipedia-en-download/train.txt", device_real, batch_size=64, max_batches=50)
         print(f"epoch {epoch+1} | test_loss={test_loss:.4f}")
 
-    def generate(model, tok, prompt, device, max_new=80, seq_len=128, temperature=0.8, top_k=40):
-        model.eval()
-        ids = tok.encode(prompt)[-seq_len:]
-        wm_state = None
-
-        for _ in range(max_new):
-            x = torch.tensor([ids], dtype=torch.long, device=device)
-            with torch.no_grad():
-                logits = model(x, wm_state)
-                logits = logits[:, -1, :] / temperature
-
-            vals, idxs = torch.topk(logits, top_k)
-            probs = torch.softmax(vals, dim=-1)
-            next_id = idxs[0, torch.multinomial(probs, 1).item()].item()
-
-            ids.append(next_id)
-            ids = ids[-seq_len:]
-
-            if tok.id2token[next_id] == "<|assistant|>":
-                break
-
-        return tok.decode(ids)
-
-    out = generate(real_model, tok, "<|user|>\nHello\n<|assistant|>\n", device_real)
-    print(out)
-
-    export_model_state(tok, real_model, hippocampus, filename="model_export.json")
-    torch.save({"model": real_model.state_dict(), "tokenizer": tok}, "model.pth")
+    torch.save({"model": real_model.state_dict(),"mirror_model":mirror_model.state_dict()}, "model.pth")
 
 
 if __name__ == "__main__":
